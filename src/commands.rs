@@ -79,6 +79,7 @@ pub fn cmd_backup(cli: &Cli) -> AppResult<()> {
     let mut seen = load_seen_ids(&cli.archive_dir)?;
     let mut records: Vec<String> = Vec::new();
     let mut new_ids: Vec<String> = Vec::new();
+    let mut deferred_tail_sources = 0usize;
 
     for source in discover_sources()? {
         let spath = source.path.to_string_lossy().to_string();
@@ -87,7 +88,7 @@ pub fn cmd_backup(cli: &Cli) -> AppResult<()> {
             .len();
         let old_offset = checkpoints.get(&spath).copied().unwrap_or(0);
         let start = if old_offset <= size { old_offset } else { 0 };
-        let (new_records, end_offset) = read_records_from_source(&source, start)?;
+        let (new_records, end_offset, deferred_tail) = read_records_from_source(&source, start)?;
         for rec in new_records {
             let id = rec
                 .split('\t')
@@ -100,11 +101,20 @@ pub fn cmd_backup(cli: &Cli) -> AppResult<()> {
             }
         }
         checkpoints.insert(spath, end_offset);
+        if deferred_tail {
+            deferred_tail_sources += 1;
+        }
     }
 
     save_checkpoints(&cli.archive_dir, &checkpoints)?;
     if records.is_empty() {
         println!("No new records discovered.");
+        if deferred_tail_sources > 0 {
+            println!(
+                "Deferred incomplete tail lines in {} source file(s); will capture next backup.",
+                deferred_tail_sources
+            );
+        }
         return Ok(());
     }
 
@@ -161,6 +171,12 @@ pub fn cmd_backup(cli: &Cli) -> AppResult<()> {
     }
 
     println!("Archived new records: {}", records.len());
+    if deferred_tail_sources > 0 {
+        println!(
+            "Deferred incomplete tail lines in {} source file(s); will capture next backup.",
+            deferred_tail_sources
+        );
+    }
     println!("Chunk written: {}", chunk_file.display());
     Ok(())
 }

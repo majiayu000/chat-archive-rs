@@ -17,6 +17,9 @@ Personal Codex + Claude Code chat backup tool in Rust.
 - `codex-raw.jsonl`
 - `claude-raw.jsonl`
 6. Recovery path via recovery code.
+7. Live-safe backup while Codex/Claude keeps writing:
+- reads each source using a file-size snapshot watermark
+- defers incomplete tail lines to next run instead of archiving partial records
 
 ## Build
 
@@ -47,6 +50,14 @@ Backup:
 chat-archive-rs --archive-dir ~/.chat-archive-rs backup --passphrase 'your-passphrase'
 ```
 
+When sources are actively growing, backup may print:
+
+```text
+Deferred incomplete tail lines in N source file(s); will capture next backup.
+```
+
+This is expected and prevents partial-line corruption during live writes.
+
 Verify:
 
 ```bash
@@ -73,4 +84,3 @@ Show discovered sources:
 ```bash
 chat-archive-rs --archive-dir ~/.chat-archive-rs show-sources
 ```
-
