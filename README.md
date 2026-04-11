@@ -11,13 +11,14 @@ Personal Codex + Claude Code chat backup tool in Rust.
 - `~/.claude/history.jsonl`
 2. Incremental append-only backup.
 3. Local encryption before any remote sync copy.
-4. Manifest hash-chain integrity verification.
-5. Full restore to:
+4. New chunks auto-compress before encryption (zstd), old chunks stay readable.
+5. Manifest hash-chain integrity verification.
+6. Full restore to:
 - `canonical-records.jsonl`
 - `codex-raw.jsonl`
 - `claude-raw.jsonl`
-6. Recovery path via recovery code.
-7. Live-safe backup while Codex/Claude keeps writing:
+7. Recovery path via recovery code.
+8. Live-safe backup while Codex/Claude keeps writing:
 - reads each source using a file-size snapshot watermark
 - defers incomplete tail lines to next run instead of archiving partial records
 
@@ -48,6 +49,21 @@ Backup:
 
 ```bash
 chat-archive-rs --archive-dir ~/.chat-archive-rs backup --passphrase 'your-passphrase'
+```
+
+Optional: tune compression level (higher = smaller, slower):
+
+```bash
+chat-archive-rs --archive-dir ~/.chat-archive-rs backup \
+  --passphrase 'your-passphrase' \
+  --compress-level 12
+```
+
+Backup output now prints payload size:
+
+```text
+Compression level: 6
+Chunk payload bytes (plain -> encrypted): 123456789 -> 34567890
 ```
 
 When sources are actively growing, backup may print:
@@ -83,4 +99,51 @@ Show discovered sources:
 
 ```bash
 chat-archive-rs --archive-dir ~/.chat-archive-rs show-sources
+```
+
+Monitoring service (built-in, weekly verify by default):
+
+```bash
+chat-archive-rs --archive-dir ~/.chat-archive-rs monitor \
+  --passphrase 'your-passphrase' \
+  --interval-sec 300 \
+  --verify-schedule weekly
+```
+
+`monitor` startup auto-writes policy to `~/.chat-archive-rs/config.json` (first run creates it):
+
+```json
+{
+  "version": 1,
+  "monitor": {
+    "interval_sec": 300,
+    "verify_schedule": "weekly",
+    "verify_every": 0,
+    "compress_level": 6
+  }
+}
+```
+
+`--verify-every` is still available as an extra cycle trigger (for example, run verify every N monitor cycles in addition to scheduled verify).
+
+Run one-shot monitor cycle (for cron/manual diagnostics):
+
+```bash
+chat-archive-rs --archive-dir ~/.chat-archive-rs monitor \
+  --passphrase 'your-passphrase' \
+  --cycles 1
+```
+
+Structured runtime logs are appended to:
+
+```text
+~/.chat-archive-rs/state/ops-log.jsonl
+```
+
+Each log line includes operation timing and sampled resource usage (`elapsed_ms`, `rss_kb`, `cpu_pct`) plus backup/verify counters, including `scheduled_verify` on monitor events.
+
+Inspect latest events:
+
+```bash
+tail -n 20 ~/.chat-archive-rs/state/ops-log.jsonl
 ```
