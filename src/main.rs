@@ -28,6 +28,7 @@ fn run() -> AppResult<()> {
         "verify" => commands::cmd_verify(&cli),
         "restore" => commands::cmd_restore(&cli),
         "recovery-test" => commands::cmd_recovery_test(&cli),
+        "monitor" => commands::cmd_monitor(&cli),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -90,8 +91,13 @@ fn print_usage() {
     println!("Commands:");
     println!("  init --passphrase <p> --recovery-code <r> [--recovery-file <file>]");
     println!("  show-sources");
-    println!("  backup [--passphrase <p> | --recovery-code <r>] [--remote-dir <dir>]");
+    println!(
+        "  backup [--passphrase <p> | --recovery-code <r>] [--remote-dir <dir>] [--compress-level <1-19>]"
+    );
     println!("  verify [--passphrase <p> | --recovery-code <r>]");
     println!("  restore --output-dir <dir> [--passphrase <p> | --recovery-code <r>]");
     println!("  recovery-test [--recovery-code <r>]");
+    println!(
+        "  monitor [--passphrase <p> | --recovery-code <r>] [--interval-sec <n>] [--verify-schedule <none|daily|weekly>] [--verify-every <n>] [--cycles <n>] [--compress-level <1-19>]"
+    );
 }
