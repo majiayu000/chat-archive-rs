@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[test]
 fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("backup-compress")?;
@@ -76,6 +79,42 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
     )?;
     let restored = fs::read_to_string(restore.join("codex-raw.jsonl"))?;
     assert_eq!(restored, format!("{raw_line}\n"));
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn init_recovery_file_is_owner_only() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("recovery-file-mode")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let recovery_file = root.join("recovery.txt");
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    let recovery_arg = path_arg(&recovery_file)?;
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+            "--recovery-file",
+            recovery_arg,
+        ],
+    )?;
+
+    let mode = fs::metadata(&recovery_file)?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(fs::read_to_string(&recovery_file)?, "test-recovery-code\n");
 
     fs::remove_dir_all(root)?;
     Ok(())
