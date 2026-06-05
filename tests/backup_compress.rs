@@ -1,9 +1,10 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+
+mod common;
+use common::{create_test_workspace, path_arg, run_cli};
 
 #[test]
 fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn Error>> {
@@ -79,38 +80,4 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
 
     fs::remove_dir_all(root)?;
     Ok(())
-}
-
-fn create_test_workspace(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = env::temp_dir().join(format!(
-        "chat-archive-rs-test-{tag}-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path)?;
-    Ok(path)
-}
-
-fn path_arg(path: &Path) -> Result<&str, Box<dyn Error>> {
-    path.to_str()
-        .ok_or_else(|| format!("path is not valid utf-8: {}", path.display()).into())
-}
-
-fn run_cli(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-    let output = Command::new(bin).args(args).env("HOME", home).output()?;
-    if output.status.success() {
-        return Ok(output);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(format!(
-        "command failed: {} {}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        bin.display(),
-        args.join(" "),
-        output.status,
-        stdout,
-        stderr
-    )
-    .into())
 }

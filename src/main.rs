@@ -1,6 +1,7 @@
 mod collector;
 mod commands;
 mod crypto;
+mod secrets;
 mod storage;
 mod types;
 mod utils;
