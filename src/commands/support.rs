@@ -65,37 +65,70 @@ pub(super) fn parse_verify_schedule(raw: &str) -> AppResult<VerifySchedule> {
 
 pub(super) fn load_or_init_monitor_policy(archive_dir: &Path) -> AppResult<MonitorPolicy> {
     let path = archive_dir.join("config.json");
-    let mut policy = default_monitor_policy();
-
-    if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .map_err(|e| format!("read monitor policy {}: {e}", path.display()))?;
-        let scope = extract_json_object(&raw, "monitor").unwrap_or(raw.as_str());
-
-        if let Some(v) = extract_json_u64_value(scope, "interval_sec")
-            && (1..=86_400).contains(&v)
-        {
-            policy.interval_sec = v;
-        }
-        if let Some(v) = extract_json_u64_value(scope, "verify_every")
-            && v <= 10_000_000
-        {
-            policy.verify_every = v;
-        }
-        if let Some(v) = extract_json_string_value(scope, "verify_schedule")
-            && let Ok(parsed) = parse_verify_schedule(&v)
-        {
-            policy.verify_schedule = parsed;
-        }
-        if let Some(v) = extract_json_i32_value(scope, "compress_level")
-            && (1..=19).contains(&v)
-        {
-            policy.compress_level = v;
-        }
+    if !path.exists() {
+        let policy = default_monitor_policy();
+        persist_monitor_policy(archive_dir, &policy)?;
+        return Ok(policy);
     }
 
-    persist_monitor_policy(archive_dir, &policy)?;
-    Ok(policy)
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("read monitor policy {}: {e}", path.display()))?;
+    parse_persisted_monitor_policy(&raw)
+        .map_err(|e| format!("invalid monitor policy {}: {e}", path.display()))
+}
+
+fn parse_persisted_monitor_policy(raw: &str) -> AppResult<MonitorPolicy> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err("malformed JSON object".to_string());
+    }
+    let scope = extract_json_object(trimmed, "monitor")
+        .ok_or_else(|| "missing monitor object or malformed JSON".to_string())?;
+
+    let interval_sec = required_json_u64(scope, "interval_sec")?;
+    if !(1..=86_400).contains(&interval_sec) {
+        return Err(format!(
+            "monitor.interval_sec out of range: {interval_sec} (expected 1..=86400)"
+        ));
+    }
+
+    let verify_every = required_json_u64(scope, "verify_every")?;
+    if verify_every > 10_000_000 {
+        return Err(format!(
+            "monitor.verify_every out of range: {verify_every} (expected 0..=10000000)"
+        ));
+    }
+
+    let verify_schedule = parse_verify_schedule(&required_json_string(scope, "verify_schedule")?)?;
+
+    let compress_level = required_json_i32(scope, "compress_level")?;
+    if !(1..=19).contains(&compress_level) {
+        return Err(format!(
+            "monitor.compress_level out of range: {compress_level} (expected 1..=19)"
+        ));
+    }
+
+    Ok(MonitorPolicy {
+        interval_sec,
+        verify_every,
+        verify_schedule,
+        compress_level,
+    })
+}
+
+fn required_json_string(raw: &str, key: &str) -> AppResult<String> {
+    extract_json_string_value(raw, key)
+        .ok_or_else(|| format!("monitor.{key} is missing or is not a JSON string"))
+}
+
+fn required_json_u64(raw: &str, key: &str) -> AppResult<u64> {
+    extract_json_u64_value(raw, key)
+        .ok_or_else(|| format!("monitor.{key} is missing or is not an unsigned integer"))
+}
+
+fn required_json_i32(raw: &str, key: &str) -> AppResult<i32> {
+    extract_json_i32_value(raw, key)
+        .ok_or_else(|| format!("monitor.{key} is missing or is not an integer"))
 }
 
 pub(super) fn persist_monitor_policy(archive_dir: &Path, policy: &MonitorPolicy) -> AppResult<()> {
