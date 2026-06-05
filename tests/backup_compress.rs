@@ -120,6 +120,64 @@ fn init_recovery_file_is_owner_only() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn backup_failure_does_not_advance_checkpoints() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("checkpoint-commit")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir)?;
+    fs::write(
+        codex_dir.join("history.jsonl"),
+        "{\"type\":\"message\",\"text\":\"must not skip\"}\n",
+    )?;
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+
+    let manifest = archive.join("manifests").join("manifest.tsv");
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o400))?;
+    let failed = run_cli_err(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+        ],
+    )?;
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("open manifest append") || stderr.contains("append manifest"),
+        "stderr did not contain manifest failure:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(archive.join("state").join("checkpoints.tsv"))?,
+        ""
+    );
+
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600))?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 fn create_test_workspace(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let path = env::temp_dir().join(format!(
@@ -150,6 +208,20 @@ fn run_cli(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn Err
         output.status,
         stdout,
         stderr
+    )
+    .into())
+}
+
+fn run_cli_err(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
+    let output = Command::new(bin).args(args).env("HOME", home).output()?;
+    if !output.status.success() {
+        return Ok(output);
+    }
+
+    Err(format!(
+        "command unexpectedly succeeded: {} {}",
+        bin.display(),
+        args.join(" ")
     )
     .into())
 }

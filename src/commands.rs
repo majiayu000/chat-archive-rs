@@ -528,9 +528,8 @@ fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
         }
     }
 
-    save_checkpoints(&cli.archive_dir, &checkpoints)?;
-
     if records.is_empty() {
+        save_checkpoints(&cli.archive_dir, &checkpoints)?;
         return Ok(BackupStats {
             sources_scanned,
             checkpoint_rewinds,
@@ -577,6 +576,7 @@ fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
         .map_err(|e| format!("append manifest: {e}"))?;
 
     append_seen_ids(&cli.archive_dir, &new_ids)?;
+    save_checkpoints(&cli.archive_dir, &checkpoints)?;
 
     if let Some(remote_dir) = cli.options.get("--remote-dir") {
         sync_to_remote(
