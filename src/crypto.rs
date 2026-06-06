@@ -11,7 +11,8 @@ use crate::types::AppResult;
 use crate::utils::hex_encode;
 
 const WRAP_VERSION: u8 = 1;
-const CHUNK_VERSION: u8 = 1;
+const CHUNK_RAW_VERSION: u8 = 1;
+const CHUNK_ZSTD_VERSION: u8 = 2;
 const KDF_ITERS: u32 = 600_000;
 
 pub fn sha256_bytes(bytes: &[u8]) -> AppResult<String> {
@@ -59,30 +60,58 @@ pub fn openssl_unwrap_b64(wrapped_b64: &str, pass: &str) -> AppResult<Vec<u8>> {
 }
 
 pub fn openssl_encrypt_chunk(plain: &[u8], pass: &str) -> AppResult<Vec<u8>> {
+    encrypt_chunk_payload(CHUNK_RAW_VERSION, plain, pass)
+}
+
+pub fn openssl_encrypt_chunk_with_level(
+    plain: &[u8],
+    pass: &str,
+    compress_level: i32,
+) -> AppResult<Vec<u8>> {
+    if !(1..=19).contains(&compress_level) {
+        return Err("invalid compression level: must be between 1 and 19".to_string());
+    }
+    let compressed = zstd::stream::encode_all(plain, compress_level)
+        .map_err(|e| format!("zstd compression failed: {e}"))?;
+    encrypt_chunk_payload(CHUNK_ZSTD_VERSION, &compressed, pass)
+}
+
+pub fn openssl_decrypt_chunk(cipher: &[u8], pass: &str) -> AppResult<Vec<u8>> {
+    let (version, decrypted) = decrypt_chunk_payload(cipher, pass)?;
+    match version {
+        CHUNK_RAW_VERSION => Ok(decrypted),
+        CHUNK_ZSTD_VERSION => zstd::stream::decode_all(decrypted.as_slice())
+            .map_err(|e| format!("zstd decompression failed: {e}")),
+        _ => Err(format!("unsupported chunk version: {version}")),
+    }
+}
+
+fn encrypt_chunk_payload(version: u8, plain: &[u8], pass: &str) -> AppResult<Vec<u8>> {
     let key = key_from_secret(pass.as_bytes());
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
     let cipher = encrypt_aes_gcm(plain, &key, &nonce)?;
     let mut out = Vec::with_capacity(1 + 12 + cipher.len());
-    out.push(CHUNK_VERSION);
+    out.push(version);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&cipher);
     Ok(out)
 }
 
-pub fn openssl_decrypt_chunk(cipher: &[u8], pass: &str) -> AppResult<Vec<u8>> {
+fn decrypt_chunk_payload(cipher: &[u8], pass: &str) -> AppResult<(u8, Vec<u8>)> {
     if cipher.len() < 1 + 12 {
         return Err("encrypted chunk too short".to_string());
     }
-    if cipher[0] != CHUNK_VERSION {
-        return Err(format!("unsupported chunk version: {}", cipher[0]));
+    let version = cipher[0];
+    if !matches!(version, CHUNK_RAW_VERSION | CHUNK_ZSTD_VERSION) {
+        return Err(format!("unsupported chunk version: {version}"));
     }
     let nonce: [u8; 12] = cipher[1..13]
         .try_into()
         .map_err(|_| "invalid chunk nonce".to_string())?;
     let body = &cipher[13..];
     let key = key_from_secret(pass.as_bytes());
-    decrypt_aes_gcm(body, &key, &nonce)
+    Ok((version, decrypt_aes_gcm(body, &key, &nonce)?))
 }
 
 fn derive_key(pass: &str, salt: &[u8; 16]) -> [u8; 32] {
@@ -132,5 +161,24 @@ mod tests {
         let enc = openssl_encrypt_chunk(b"data-123", "k").expect("enc");
         let dec = openssl_decrypt_chunk(&enc, "k").expect("dec");
         assert_eq!(dec, b"data-123");
+    }
+
+    #[test]
+    fn test_compressed_chunk_encrypt_decrypt_roundtrip() -> AppResult<()> {
+        let plain = b"chat archive line\n".repeat(256);
+        let enc = openssl_encrypt_chunk_with_level(&plain, "k", 12)?;
+        assert_eq!(enc[0], CHUNK_ZSTD_VERSION);
+        let dec = openssl_decrypt_chunk(&enc, "k")?;
+        assert_eq!(dec, plain);
+        Ok(())
+    }
+
+    #[test]
+    fn test_compressed_chunk_rejects_invalid_level() {
+        let err = match openssl_encrypt_chunk_with_level(b"data", "k", 20) {
+            Ok(_) => panic!("invalid compression level unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "invalid compression level: must be between 1 and 19");
     }
 }

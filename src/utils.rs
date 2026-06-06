@@ -45,6 +45,32 @@ pub fn append_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
         .map_err(|e| format!("append {}: {e}", path.display()))
 }
 
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("create private file {}: {e}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod private file {}: {e}", path.display()))?;
+        file.write_all(bytes)
+            .map_err(|e| format!("write private file {}: {e}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+            .map_err(|e| format!("write private file {}: {e}", path.display()))
+    }
+}
+
 pub fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
