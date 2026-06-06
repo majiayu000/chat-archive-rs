@@ -131,49 +131,106 @@ pub fn load_env_file(path: &Path) -> AppResult<HashMap<String, String>> {
 
 pub fn sync_to_remote(root: &Path, remote: &Path, chunk_file: Option<&Path>) -> AppResult<()> {
     fs::create_dir_all(remote).map_err(|e| format!("mkdir remote: {e}"))?;
+
+    let chunk_dir = remote.join("chunks");
+    fs::create_dir_all(&chunk_dir).map_err(|e| format!("mkdir remote/chunks: {e}"))?;
+    copy_dir_files(&root.join("chunks"), &chunk_dir, "chunks")?;
+    if let Some(chunk) = chunk_file
+        && !chunk.starts_with(root.join("chunks"))
+    {
+        copy_file_to_dir(chunk, &chunk_dir, "chunk")?;
+    }
+
     for rel in ["manifests", "keys"] {
         let src_dir = root.join(rel);
         let dst_dir = remote.join(rel);
         fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir remote/{rel}: {e}"))?;
-        if src_dir.exists() {
-            for entry in fs::read_dir(&src_dir)
-                .map_err(|e| format!("read_dir {}: {e}", src_dir.display()))?
-            {
-                let entry =
-                    entry.map_err(|e| format!("read_dir entry {}: {e}", src_dir.display()))?;
-                let p = entry.path();
-                if p.is_file() {
-                    let target = dst_dir.join(
-                        p.file_name()
-                            .ok_or_else(|| format!("invalid file name {}", p.display()))?,
-                    );
-                    fs::copy(&p, &target).map_err(|e| {
-                        format!("copy {} -> {}: {e}", p.display(), target.display())
-                    })?;
-                }
-            }
-        }
+        copy_dir_files(&src_dir, &dst_dir, rel)?;
     }
     let config_src = root.join("config.json");
     if config_src.exists() {
         fs::copy(&config_src, remote.join("config.json"))
             .map_err(|e| format!("copy config: {e}"))?;
     }
-    if let Some(chunk) = chunk_file {
-        let dst = remote.join("chunks");
-        fs::create_dir_all(&dst).map_err(|e| format!("mkdir remote/chunks: {e}"))?;
-        let target = dst.join(
-            chunk
-                .file_name()
-                .ok_or_else(|| format!("invalid chunk filename {}", chunk.display()))?,
-        );
-        fs::copy(chunk, &target).map_err(|e| {
-            format!(
-                "copy chunk {} -> {}: {e}",
-                chunk.display(),
-                target.display()
-            )
-        })?;
+    Ok(())
+}
+
+fn copy_dir_files(src_dir: &Path, dst_dir: &Path, label: &str) -> AppResult<()> {
+    if !src_dir.exists() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(src_dir).map_err(|e| format!("read_dir {}: {e}", src_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", src_dir.display()))?;
+        let path = entry.path();
+        if path.is_file() {
+            copy_file_to_dir(&path, dst_dir, label)?;
+        }
     }
     Ok(())
+}
+
+fn copy_file_to_dir(path: &Path, dst_dir: &Path, label: &str) -> AppResult<()> {
+    let target = dst_dir.join(
+        path.file_name()
+            .ok_or_else(|| format!("invalid {label} filename {}", path.display()))?,
+    );
+    fs::copy(path, &target)
+        .map_err(|e| format!("copy {} -> {}: {e}", path.display(), target.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::error::Error;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn sync_to_remote_repairs_missing_older_chunks() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-repairs-chunks")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        fs::create_dir_all(archive.join("chunks"))?;
+        fs::create_dir_all(archive.join("manifests"))?;
+        fs::create_dir_all(archive.join("keys"))?;
+
+        let old_chunk = archive.join("chunks").join("old.enc");
+        let new_chunk = archive.join("chunks").join("new.enc");
+        fs::write(&old_chunk, b"old")?;
+        fs::write(&new_chunk, b"new")?;
+        fs::write(archive.join("manifests").join("manifest.tsv"), b"manifest")?;
+        fs::write(archive.join("keys").join("keys.env"), b"keys")?;
+
+        fs::create_dir_all(remote.join("manifests"))?;
+        fs::write(
+            remote.join("manifests").join("manifest.tsv"),
+            b"stale manifest",
+        )?;
+
+        sync_to_remote(&archive, &remote, Some(&new_chunk))?;
+
+        assert_eq!(fs::read(remote.join("chunks").join("old.enc"))?, b"old");
+        assert_eq!(fs::read(remote.join("chunks").join("new.enc"))?, b"new");
+        assert_eq!(
+            fs::read(remote.join("manifests").join("manifest.tsv"))?,
+            b"manifest"
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn test_dir(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!(
+            "chat-archive-rs-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
 }
