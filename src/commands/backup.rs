@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -5,10 +6,7 @@ use std::time::Instant;
 
 use crate::collector::{discover_sources, read_records_from_source};
 use crate::crypto::{openssl_encrypt_chunk_with_level, sha256_bytes};
-use crate::storage::{
-    append_seen_ids, load_checkpoints, load_manifest_entries, load_seen_ids, save_checkpoints,
-    sync_to_remote,
-};
+use crate::storage::{StateStore, load_manifest_entries, sync_to_remote};
 use crate::types::{AppResult, Cli};
 use crate::utils::{expand_tilde, json_escape, random_hex, utc_iso, utc_stamp};
 
@@ -95,10 +93,11 @@ pub fn cmd_backup(cli: &Cli) -> AppResult<()> {
 pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
     let archive_key = unlock_archive_key(cli)?;
     let compress_level = parse_compress_level(cli.options.get("--compress-level"))?;
-    let mut checkpoints = load_checkpoints(&cli.archive_dir)?;
-    let mut seen = load_seen_ids(&cli.archive_dir)?;
+    let mut state = StateStore::open(&cli.archive_dir)?;
     let mut records: Vec<String> = Vec::new();
     let mut new_ids: Vec<String> = Vec::new();
+    let mut new_ids_seen: HashSet<String> = HashSet::new();
+    let mut checkpoint_updates: Vec<(String, u64)> = Vec::new();
     let mut deferred_tail_sources = 0usize;
     let mut sources_scanned = 0usize;
     let mut checkpoint_rewinds = 0usize;
@@ -109,7 +108,7 @@ pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
         let size = fs::metadata(&source.path)
             .map_err(|e| format!("stat {}: {e}", source.path.display()))?
             .len();
-        let old_offset = checkpoints.get(&spath).copied().unwrap_or(0);
+        let old_offset = state.checkpoint(&spath)?.unwrap_or(0);
         let start = if old_offset <= size {
             old_offset
         } else {
@@ -123,19 +122,22 @@ pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
                 .next()
                 .ok_or_else(|| "invalid record format".to_string())?
                 .to_string();
-            if seen.insert(id.clone()) {
-                new_ids.push(id);
+            if !state.has_seen_id(&id)? && new_ids_seen.insert(id.clone()) {
+                new_ids.push(id.clone());
                 records.push(rec);
             }
         }
-        checkpoints.insert(spath, end_offset);
+        checkpoint_updates.push((spath, end_offset));
         if deferred_tail {
             deferred_tail_sources += 1;
         }
     }
 
     if records.is_empty() {
-        save_checkpoints(&cli.archive_dir, &checkpoints)?;
+        state.commit_backup_state(&checkpoint_updates, &[])?;
+        if let Some(remote_dir) = cli.options.get("--remote-dir") {
+            sync_to_remote(&cli.archive_dir, &expand_tilde(remote_dir), None)?;
+        }
         return Ok(BackupStats {
             sources_scanned,
             checkpoint_rewinds,
@@ -181,8 +183,7 @@ pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
     mf.write_all(line.as_bytes())
         .map_err(|e| format!("append manifest: {e}"))?;
 
-    append_seen_ids(&cli.archive_dir, &new_ids)?;
-    save_checkpoints(&cli.archive_dir, &checkpoints)?;
+    state.commit_backup_state(&checkpoint_updates, &new_ids)?;
 
     if let Some(remote_dir) = cli.options.get("--remote-dir") {
         sync_to_remote(

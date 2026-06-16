@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::collector::discover_sources;
 use crate::crypto::{openssl_unwrap_b64, openssl_wrap_b64, sha256_bytes};
-use crate::storage::load_env_file;
+use crate::storage::{StateStore, load_env_file};
 use crate::types::{AppResult, Cli};
 use crate::utils::{expand_tilde, random_hex, utc_iso, write_private_file};
 
@@ -41,10 +41,8 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
                 .map_err(|e| format!("chmod keys: {e}"))?;
         }
 
-        File::create(cli.archive_dir.join("state").join("checkpoints.tsv"))
-            .map_err(|e| format!("create checkpoints: {e}"))?;
-        File::create(cli.archive_dir.join("state").join("seen_ids.txt"))
-            .map_err(|e| format!("create seen_ids: {e}"))?;
+        let mut state = StateStore::open(&cli.archive_dir)?;
+        state.reset_for_init()?;
         File::create(cli.archive_dir.join("manifests").join("manifest.tsv"))
             .map_err(|e| format!("create manifest: {e}"))?;
 

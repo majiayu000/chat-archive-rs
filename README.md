@@ -140,6 +140,15 @@ Structured runtime logs are appended to:
 ~/.chat-archive-rs/state/ops-log.jsonl
 ```
 
+Incremental checkpoint and seen-record state is stored transactionally in:
+
+```text
+~/.chat-archive-rs/state/state.db
+```
+
+Archives created with older `checkpoints.tsv` and `seen_ids.txt` files are migrated into this
+database on first use.
+
 Each log line includes operation timing and sampled resource usage (`elapsed_ms`, `rss_kb`, `cpu_pct`) plus backup/verify counters, including `scheduled_verify` on monitor events.
 
 Inspect latest events:
