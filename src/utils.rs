@@ -1,5 +1,4 @@
 use std::env;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,18 +35,10 @@ pub fn random_hex(n_bytes: usize) -> AppResult<String> {
     Ok(hex_encode(&buf))
 }
 
-pub fn append_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    let mut f = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|e| format!("open append {}: {e}", path.display()))?;
-    f.write_all(bytes)
-        .map_err(|e| format!("append {}: {e}", path.display()))
-}
-
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
     #[cfg(unix)]
     {
+        use std::fs::OpenOptions;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let mut file = OpenOptions::new()
@@ -60,8 +51,7 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod private file {}: {e}", path.display()))?;
         file.write_all(bytes)
-            .map_err(|e| format!("write private file {}: {e}", path.display()))?;
-        return Ok(());
+            .map_err(|e| format!("write private file {}: {e}", path.display()))
     }
 
     #[cfg(not(unix))]

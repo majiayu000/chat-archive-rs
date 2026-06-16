@@ -59,6 +59,7 @@ pub fn openssl_unwrap_b64(wrapped_b64: &str, pass: &str) -> AppResult<Vec<u8>> {
     decrypt_aes_gcm(cipher, &key, &nonce)
 }
 
+#[cfg(test)]
 pub fn openssl_encrypt_chunk(plain: &[u8], pass: &str) -> AppResult<Vec<u8>> {
     encrypt_chunk_payload(CHUNK_RAW_VERSION, plain, pass)
 }
