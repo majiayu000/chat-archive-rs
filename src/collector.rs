@@ -6,6 +6,11 @@ use std::path::Path;
 use crate::types::{AppResult, SourceFile};
 use crate::utils::{fnv1a_hex, hex_encode};
 
+pub struct SourceReadStats {
+    pub commit_offset: u64,
+    pub deferred_partial_line: bool,
+}
+
 pub fn discover_sources() -> AppResult<Vec<SourceFile>> {
     let home = env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
     let mut out = Vec::new();
@@ -42,10 +47,27 @@ pub fn discover_sources() -> AppResult<Vec<SourceFile>> {
     Ok(out)
 }
 
+#[cfg(test)]
 pub fn read_records_from_source(
     source: &SourceFile,
     start_offset: u64,
 ) -> AppResult<(Vec<String>, u64, bool)> {
+    let mut out = Vec::new();
+    let stats = stream_records_from_source(source, start_offset, |record| {
+        out.push(record);
+        Ok(())
+    })?;
+    Ok((out, stats.commit_offset, stats.deferred_partial_line))
+}
+
+pub fn stream_records_from_source<F>(
+    source: &SourceFile,
+    start_offset: u64,
+    mut on_record: F,
+) -> AppResult<SourceReadStats>
+where
+    F: FnMut(String) -> AppResult<()>,
+{
     let mut file =
         File::open(&source.path).map_err(|e| format!("open {}: {e}", source.path.display()))?;
     let snapshot_size = file
@@ -59,7 +81,6 @@ pub fn read_records_from_source(
     let mut reader = BufReader::new(limited);
     let mut read_offset = start;
     let mut commit_offset = start;
-    let mut out = Vec::new();
     let mut deferred_partial_line = false;
     loop {
         let mut line = String::new();
@@ -94,13 +115,16 @@ pub fn read_records_from_source(
         );
         let path_hex = hex_encode(source.path.to_string_lossy().as_bytes());
         let raw_hex = hex_encode(trimmed.as_bytes());
-        out.push(format!(
+        on_record(format!(
             "{record_id}\t{}\t{path_hex}\t{line_offset}\t{raw_hash}\t{raw_hex}",
             source.provider
-        ));
+        ))?;
         commit_offset = read_offset;
     }
-    Ok((out, commit_offset, deferred_partial_line))
+    Ok(SourceReadStats {
+        commit_offset,
+        deferred_partial_line,
+    })
 }
 
 fn walk_jsonl(provider: &str, dir: &Path, out: &mut Vec<SourceFile>) -> AppResult<()> {

@@ -85,6 +85,199 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
 }
 
 #[test]
+fn backup_rotates_chunks_at_plaintext_threshold() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("backup-chunk-rotation")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let restore = root.join("restore");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir)?;
+    let raw_lines = [
+        "{\"type\":\"message\",\"text\":\"chunk one\"}",
+        "{\"type\":\"message\",\"text\":\"chunk two\"}",
+        "{\"type\":\"message\",\"text\":\"chunk three\"}",
+        "{\"type\":\"message\",\"text\":\"chunk four\"}",
+        "{\"type\":\"message\",\"text\":\"chunk five\"}",
+        "{\"type\":\"message\",\"text\":\"chunk six\"}",
+    ];
+    fs::write(
+        codex_dir.join("history.jsonl"),
+        format!("{}\n", raw_lines.join("\n")),
+    )?;
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    let restore_arg = path_arg(&restore)?;
+    let envs = [("CHAT_ARCHIVE_CHUNK_PLAIN_BYTES", "2000")];
+
+    init_archive(bin, &home, archive_arg, &envs)?;
+    let backup = run_cli_with_env(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+        ],
+        &envs,
+    )?;
+    let backup_stdout = String::from_utf8_lossy(&backup.stdout);
+    assert!(backup_stdout.contains("Chunks written: "));
+    let chunk_count = fs::read_dir(archive.join("chunks"))?.count();
+    assert!(
+        chunk_count > 1 && chunk_count < raw_lines.len(),
+        "expected multiple aggregated chunks, got {chunk_count}"
+    );
+    assert_eq!(
+        fs::read_to_string(archive.join("manifests").join("manifest.tsv"))?
+            .lines()
+            .count(),
+        chunk_count
+    );
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "verify",
+            "--passphrase",
+            "test-passphrase",
+        ],
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "restore",
+            "--passphrase",
+            "test-passphrase",
+            "--output-dir",
+            restore_arg,
+        ],
+    )?;
+    assert_eq!(
+        fs::read_to_string(restore.join("codex-raw.jsonl"))?,
+        format!("{}\n", raw_lines.join("\n"))
+    );
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn backup_recovers_state_after_manifest_replace_failure() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("backup-pending-recovery")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let restore = root.join("restore");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir)?;
+    let raw_lines = [
+        "{\"type\":\"message\",\"text\":\"recover one\"}",
+        "{\"type\":\"message\",\"text\":\"recover two\"}",
+        "{\"type\":\"message\",\"text\":\"recover three\"}",
+    ];
+    fs::write(
+        codex_dir.join("history.jsonl"),
+        format!("{}\n", raw_lines.join("\n")),
+    )?;
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    let restore_arg = path_arg(&restore)?;
+    let envs = [
+        ("CHAT_ARCHIVE_CHUNK_PLAIN_BYTES", "1"),
+        ("CHAT_ARCHIVE_FAIL_AFTER_MANIFEST_REPLACE", "1"),
+    ];
+
+    init_archive(bin, &home, archive_arg, &envs)?;
+    let failed = run_cli_err_with_env(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+        ],
+        &envs,
+    )?;
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("CHAT_ARCHIVE_FAIL_AFTER_MANIFEST_REPLACE requested failure"),
+        "stderr did not contain injected failure:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(archive.join("manifests").join("manifest.tsv"))?
+            .lines()
+            .count(),
+        3
+    );
+
+    let retry_envs = [("CHAT_ARCHIVE_CHUNK_PLAIN_BYTES", "1")];
+    let retry = run_cli_with_env(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+        ],
+        &retry_envs,
+    )?;
+    let retry_stdout = String::from_utf8_lossy(&retry.stdout);
+    assert!(retry_stdout.contains("No new records discovered."));
+    assert_eq!(fs::read_dir(archive.join("chunks"))?.count(), 3);
+    assert_eq!(
+        fs::read_to_string(archive.join("manifests").join("manifest.tsv"))?
+            .lines()
+            .count(),
+        3
+    );
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "verify",
+            "--passphrase",
+            "test-passphrase",
+        ],
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "restore",
+            "--passphrase",
+            "test-passphrase",
+            "--output-dir",
+            restore_arg,
+        ],
+    )?;
+    assert_eq!(
+        fs::read_to_string(restore.join("codex-raw.jsonl"))?,
+        format!("{}\n", raw_lines.join("\n"))
+    );
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn backup_after_restart_skips_seen_records() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("backup-incremental-restart")?;
     let home = root.join("home");
@@ -353,8 +546,8 @@ fn backup_failure_does_not_advance_checkpoints() -> Result<(), Box<dyn Error>> {
         ],
     )?;
 
-    let manifest = archive.join("manifests").join("manifest.tsv");
-    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o400))?;
+    let manifest_dir = archive.join("manifests");
+    fs::set_permissions(&manifest_dir, fs::Permissions::from_mode(0o500))?;
     let failed = run_cli_err(
         bin,
         &home,
@@ -368,10 +561,10 @@ fn backup_failure_does_not_advance_checkpoints() -> Result<(), Box<dyn Error>> {
     )?;
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(
-        stderr.contains("open manifest append") || stderr.contains("append manifest"),
+        stderr.contains("replace manifest"),
         "stderr did not contain manifest failure:\n{stderr}"
     );
-    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&manifest_dir, fs::Permissions::from_mode(0o700))?;
     let retry = run_cli(
         bin,
         &home,
@@ -461,7 +654,21 @@ fn init_archive(
 }
 
 fn run_cli_err(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-    let output = Command::new(bin).args(args).env("HOME", home).output()?;
+    run_cli_err_with_env(bin, home, args, &[])
+}
+
+fn run_cli_err_with_env(
+    bin: &Path,
+    home: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new(bin);
+    command.args(args).env("HOME", home);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output()?;
     if !output.status.success() {
         return Ok(output);
     }
