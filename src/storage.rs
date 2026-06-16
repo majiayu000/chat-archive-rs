@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -61,6 +61,7 @@ impl StateStore {
         offset.map(i64_to_u64).transpose()
     }
 
+    #[cfg(test)]
     pub fn has_seen_id(&self, record_id: &str) -> AppResult<bool> {
         let exists = self
             .conn
@@ -72,6 +73,167 @@ impl StateStore {
             .optional()
             .map_err(|e| format!("query seen id: {e}"))?;
         Ok(exists.is_some())
+    }
+
+    pub fn recover_pending_backups(&mut self, root: &Path) -> AppResult<usize> {
+        let op_ids = self.pending_backup_op_ids()?;
+        let mut recovered = 0usize;
+        for op_id in op_ids {
+            let manifest_entries = self.pending_manifest_entries(&op_id)?;
+            if manifest_entries.is_empty() {
+                self.discard_pending_backup(root, &op_id)?;
+                continue;
+            }
+
+            if manifest_contains_pending_lines(root, &manifest_entries)? {
+                self.commit_pending_backup_state(&op_id)?;
+                recovered += 1;
+            } else {
+                self.discard_pending_backup(root, &op_id)?;
+            }
+        }
+        Ok(recovered)
+    }
+
+    pub fn begin_pending_backup(&mut self, op_id: &str) -> AppResult<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin pending backup: {e}"))?;
+        delete_pending_backup_rows(&tx, &self.archive_key, op_id)?;
+        tx.execute(
+            "INSERT INTO pending_backup_ops(archive_key, op_id) VALUES(?1, ?2)",
+            params![&self.archive_key, op_id],
+        )
+        .map_err(|e| format!("create pending backup: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit pending backup begin: {e}"))
+    }
+
+    pub fn stage_pending_seen_id(&self, op_id: &str, record_id: &str) -> AppResult<bool> {
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_backup_seen_ids(archive_key, op_id, record_id)
+                 SELECT ?1, ?2, ?3
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM seen_ids WHERE archive_key = ?1 AND record_id = ?3
+                 )",
+                params![&self.archive_key, op_id, record_id],
+            )
+            .map_err(|e| format!("stage pending seen id: {e}"))?;
+        Ok(inserted == 1)
+    }
+
+    pub fn stage_pending_checkpoint_updates(
+        &mut self,
+        op_id: &str,
+        checkpoint_updates: &[(String, u64)],
+    ) -> AppResult<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin pending checkpoints: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_backup_checkpoints WHERE archive_key = ?1 AND op_id = ?2",
+            params![&self.archive_key, op_id],
+        )
+        .map_err(|e| format!("clear pending checkpoints: {e}"))?;
+        for (path, offset) in checkpoint_updates {
+            tx.execute(
+                "INSERT INTO pending_backup_checkpoints(archive_key, op_id, path, offset)
+                 VALUES(?1, ?2, ?3, ?4)",
+                params![
+                    &self.archive_key,
+                    op_id,
+                    path,
+                    u64_to_i64(*offset, "pending checkpoint offset")?
+                ],
+            )
+            .map_err(|e| format!("stage pending checkpoint: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit pending checkpoints: {e}"))
+    }
+
+    pub fn stage_pending_manifest_entries(
+        &mut self,
+        op_id: &str,
+        entries: &[(String, String)],
+    ) -> AppResult<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin pending manifest entries: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_backup_manifest_entries WHERE archive_key = ?1 AND op_id = ?2",
+            params![&self.archive_key, op_id],
+        )
+        .map_err(|e| format!("clear pending manifest entries: {e}"))?;
+        for (idx, (chunk_rel, manifest_line)) in entries.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO pending_backup_manifest_entries(
+                     archive_key, op_id, ordinal, chunk_rel, manifest_line
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &self.archive_key,
+                    op_id,
+                    u64_to_i64(idx as u64, "pending manifest ordinal")?,
+                    chunk_rel,
+                    manifest_line
+                ],
+            )
+            .map_err(|e| format!("stage pending manifest entry: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit pending manifest entries: {e}"))
+    }
+
+    pub fn commit_pending_backup_state(&mut self, op_id: &str) -> AppResult<()> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin pending state commit: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO checkpoints(archive_key, path, offset)
+             SELECT archive_key, path, offset
+             FROM pending_backup_checkpoints
+             WHERE archive_key = ?1 AND op_id = ?2",
+            params![&self.archive_key, op_id],
+        )
+        .map_err(|e| format!("commit pending checkpoints: {e}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO seen_ids(archive_key, record_id)
+             SELECT archive_key, record_id
+             FROM pending_backup_seen_ids
+             WHERE archive_key = ?1 AND op_id = ?2",
+            params![&self.archive_key, op_id],
+        )
+        .map_err(|e| format!("commit pending seen ids: {e}"))?;
+        delete_pending_backup_rows(&tx, &self.archive_key, op_id)?;
+        tx.commit()
+            .map_err(|e| format!("commit pending state transaction: {e}"))
+    }
+
+    pub fn discard_pending_backup(&mut self, root: &Path, op_id: &str) -> AppResult<()> {
+        let manifest_lines = manifest_line_set(root)?;
+        for (chunk_rel, manifest_line) in self.pending_manifest_entries(op_id)? {
+            if manifest_lines.contains(&manifest_line) {
+                continue;
+            }
+            let chunk_path = root.join(&chunk_rel);
+            if chunk_path.exists() {
+                fs::remove_file(&chunk_path)
+                    .map_err(|e| format!("remove abandoned chunk {}: {e}", chunk_path.display()))?;
+            }
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin pending discard: {e}"))?;
+        delete_pending_backup_rows(&tx, &self.archive_key, op_id)?;
+        tx.commit()
+            .map_err(|e| format!("commit pending discard: {e}"))
     }
 
     pub fn commit_backup_state(
@@ -122,6 +284,26 @@ impl StateStore {
         )
         .map_err(|e| format!("reset seen ids: {e}"))?;
         tx.execute(
+            "DELETE FROM pending_backup_manifest_entries WHERE archive_key = ?1",
+            params![&self.archive_key],
+        )
+        .map_err(|e| format!("reset pending manifest entries: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_backup_checkpoints WHERE archive_key = ?1",
+            params![&self.archive_key],
+        )
+        .map_err(|e| format!("reset pending checkpoints: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_backup_seen_ids WHERE archive_key = ?1",
+            params![&self.archive_key],
+        )
+        .map_err(|e| format!("reset pending seen ids: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_backup_ops WHERE archive_key = ?1",
+            params![&self.archive_key],
+        )
+        .map_err(|e| format!("reset pending backup ops: {e}"))?;
+        tx.execute(
             "INSERT OR REPLACE INTO state_meta(archive_key, key, value) VALUES(?1, ?2, '1')",
             params![&self.archive_key, LEGACY_TSV_MIGRATION_KEY],
         )
@@ -145,13 +327,70 @@ impl StateStore {
                      offset INTEGER NOT NULL CHECK(offset >= 0),
                      PRIMARY KEY(archive_key, path)
                  );
-                 CREATE TABLE IF NOT EXISTS seen_ids (
-                     archive_key TEXT NOT NULL,
-                     record_id TEXT NOT NULL,
-                     PRIMARY KEY(archive_key, record_id)
-                 );",
+	                 CREATE TABLE IF NOT EXISTS seen_ids (
+	                     archive_key TEXT NOT NULL,
+	                     record_id TEXT NOT NULL,
+	                     PRIMARY KEY(archive_key, record_id)
+	                 );
+	                 CREATE TABLE IF NOT EXISTS pending_backup_ops (
+	                     archive_key TEXT NOT NULL,
+	                     op_id TEXT NOT NULL,
+	                     PRIMARY KEY(archive_key, op_id)
+	                 );
+	                 CREATE TABLE IF NOT EXISTS pending_backup_checkpoints (
+	                     archive_key TEXT NOT NULL,
+	                     op_id TEXT NOT NULL,
+	                     path TEXT NOT NULL,
+	                     offset INTEGER NOT NULL CHECK(offset >= 0),
+	                     PRIMARY KEY(archive_key, op_id, path)
+	                 );
+	                 CREATE TABLE IF NOT EXISTS pending_backup_seen_ids (
+	                     archive_key TEXT NOT NULL,
+	                     op_id TEXT NOT NULL,
+	                     record_id TEXT NOT NULL,
+	                     PRIMARY KEY(archive_key, op_id, record_id)
+	                 );
+	                 CREATE TABLE IF NOT EXISTS pending_backup_manifest_entries (
+	                     archive_key TEXT NOT NULL,
+	                     op_id TEXT NOT NULL,
+	                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+	                     chunk_rel TEXT NOT NULL,
+	                     manifest_line TEXT NOT NULL,
+	                     PRIMARY KEY(archive_key, op_id, ordinal)
+	                 );",
             )
             .map_err(|e| format!("initialize state db schema: {e}"))
+    }
+
+    fn pending_backup_op_ids(&self) -> AppResult<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT op_id FROM pending_backup_ops WHERE archive_key = ?1 ORDER BY op_id")
+            .map_err(|e| format!("prepare pending backup ops: {e}"))?;
+        let rows = stmt
+            .query_map(params![&self.archive_key], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query pending backup ops: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read pending backup op: {e}"))
+    }
+
+    fn pending_manifest_entries(&self, op_id: &str) -> AppResult<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT chunk_rel, manifest_line
+                 FROM pending_backup_manifest_entries
+                 WHERE archive_key = ?1 AND op_id = ?2
+                 ORDER BY ordinal",
+            )
+            .map_err(|e| format!("prepare pending manifest entries: {e}"))?;
+        let rows = stmt
+            .query_map(params![&self.archive_key, op_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("query pending manifest entries: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read pending manifest entry: {e}"))
     }
 
     fn migrate_legacy_tsv(&mut self, root: &Path) -> AppResult<()> {
@@ -247,6 +486,47 @@ fn u64_to_i64(value: u64, label: &str) -> AppResult<i64> {
 
 fn i64_to_u64(value: i64) -> AppResult<u64> {
     u64::try_from(value).map_err(|_| format!("negative checkpoint offset in state db: {value}"))
+}
+
+fn delete_pending_backup_rows(
+    tx: &rusqlite::Transaction<'_>,
+    archive_key: &str,
+    op_id: &str,
+) -> AppResult<()> {
+    for table in [
+        "pending_backup_manifest_entries",
+        "pending_backup_checkpoints",
+        "pending_backup_seen_ids",
+        "pending_backup_ops",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE archive_key = ?1 AND op_id = ?2");
+        tx.execute(&sql, params![archive_key, op_id])
+            .map_err(|e| format!("delete {table}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn manifest_contains_pending_lines(root: &Path, entries: &[(String, String)]) -> AppResult<bool> {
+    let manifest_lines = manifest_line_set(root)?;
+    Ok(entries
+        .iter()
+        .all(|(_, manifest_line)| manifest_lines.contains(manifest_line)))
+}
+
+fn manifest_line_set(root: &Path) -> AppResult<HashSet<String>> {
+    let path = root.join("manifests").join("manifest.tsv");
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let f = File::open(path).map_err(|e| format!("open manifest: {e}"))?;
+    let mut lines = HashSet::new();
+    for line in BufReader::new(f).lines() {
+        let line = line.map_err(|e| format!("read manifest: {e}"))?;
+        if !line.trim().is_empty() {
+            lines.insert(line);
+        }
+    }
+    Ok(lines)
 }
 
 pub fn load_manifest_entries(root: &Path) -> AppResult<Vec<ManifestEntry>> {

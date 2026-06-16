@@ -99,6 +99,7 @@ pub fn cmd_monitor(cli: &Cli) -> AppResult<()> {
                         format!("\"deferred_tail_sources\":{}", stats.deferred_tail_sources),
                         format!("\"new_records\":{}", stats.new_records),
                         format!("\"compress_level\":{}", stats.compress_level),
+                        format!("\"chunk_count\":{}", stats.chunk_count),
                         format!("\"plain_bytes\":{}", stats.plain_bytes),
                         format!("\"cipher_bytes\":{}", stats.cipher_bytes),
                         format!("\"compression_ratio\":{:.6}", ratio),
