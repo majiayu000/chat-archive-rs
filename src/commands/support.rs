@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::crypto::{openssl_unwrap_b64, sha256_bytes};
 use crate::storage::load_env_file;
@@ -28,12 +29,47 @@ impl VerifySchedule {
     }
 }
 
+impl Serialize for VerifySchedule {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for VerifySchedule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        parse_verify_schedule(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MonitorPolicy {
     pub(super) interval_sec: u64,
     pub(super) verify_every: u64,
     pub(super) verify_schedule: VerifySchedule,
     pub(super) compress_level: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMonitorConfig {
+    version: u64,
+    monitor: PersistedMonitorPolicy,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedMonitorPolicy {
+    interval_sec: u64,
+    verify_schedule: VerifySchedule,
+    verify_every: u64,
+    compress_level: i32,
 }
 
 #[derive(Debug, Default)]
@@ -78,30 +114,35 @@ pub(super) fn load_or_init_monitor_policy(archive_dir: &Path) -> AppResult<Monit
 }
 
 fn parse_persisted_monitor_policy(raw: &str) -> AppResult<MonitorPolicy> {
-    let trimmed = raw.trim();
-    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        return Err("malformed JSON object".to_string());
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("malformed JSON object: {e}"))?;
+    if !value.is_object() {
+        return Err("malformed JSON object: expected object".to_string());
     }
-    let scope = extract_json_object(trimmed, "monitor")
-        .ok_or_else(|| "missing monitor object or malformed JSON".to_string())?;
+    let persisted: PersistedMonitorConfig =
+        serde_json::from_value(value).map_err(|e| format!("invalid monitor policy shape: {e}"))?;
+    if persisted.version != 1 {
+        return Err(format!(
+            "unsupported monitor policy version: {}",
+            persisted.version
+        ));
+    }
 
-    let interval_sec = required_json_u64(scope, "interval_sec")?;
+    let interval_sec = persisted.monitor.interval_sec;
     if !(1..=86_400).contains(&interval_sec) {
         return Err(format!(
             "monitor.interval_sec out of range: {interval_sec} (expected 1..=86400)"
         ));
     }
 
-    let verify_every = required_json_u64(scope, "verify_every")?;
+    let verify_every = persisted.monitor.verify_every;
     if verify_every > 10_000_000 {
         return Err(format!(
             "monitor.verify_every out of range: {verify_every} (expected 0..=10000000)"
         ));
     }
 
-    let verify_schedule = parse_verify_schedule(&required_json_string(scope, "verify_schedule")?)?;
-
-    let compress_level = required_json_i32(scope, "compress_level")?;
+    let compress_level = persisted.monitor.compress_level;
     if !(1..=19).contains(&compress_level) {
         return Err(format!(
             "monitor.compress_level out of range: {compress_level} (expected 1..=19)"
@@ -111,34 +152,26 @@ fn parse_persisted_monitor_policy(raw: &str) -> AppResult<MonitorPolicy> {
     Ok(MonitorPolicy {
         interval_sec,
         verify_every,
-        verify_schedule,
+        verify_schedule: persisted.monitor.verify_schedule,
         compress_level,
     })
 }
 
-fn required_json_string(raw: &str, key: &str) -> AppResult<String> {
-    extract_json_string_value(raw, key)
-        .ok_or_else(|| format!("monitor.{key} is missing or is not a JSON string"))
-}
-
-fn required_json_u64(raw: &str, key: &str) -> AppResult<u64> {
-    extract_json_u64_value(raw, key)
-        .ok_or_else(|| format!("monitor.{key} is missing or is not an unsigned integer"))
-}
-
-fn required_json_i32(raw: &str, key: &str) -> AppResult<i32> {
-    extract_json_i32_value(raw, key)
-        .ok_or_else(|| format!("monitor.{key} is missing or is not an integer"))
-}
-
 pub(super) fn persist_monitor_policy(archive_dir: &Path, policy: &MonitorPolicy) -> AppResult<()> {
     let path = archive_dir.join("config.json");
+    let persisted = PersistedMonitorConfig {
+        version: 1,
+        monitor: PersistedMonitorPolicy {
+            interval_sec: policy.interval_sec,
+            verify_schedule: policy.verify_schedule,
+            verify_every: policy.verify_every,
+            compress_level: policy.compress_level,
+        },
+    };
     let body = format!(
-        "{{\n  \"version\": 1,\n  \"monitor\": {{\n    \"interval_sec\": {},\n    \"verify_schedule\": \"{}\",\n    \"verify_every\": {},\n    \"compress_level\": {}\n  }}\n}}\n",
-        policy.interval_sec,
-        policy.verify_schedule.as_str(),
-        policy.verify_every,
-        policy.compress_level
+        "{}\n",
+        serde_json::to_string_pretty(&persisted)
+            .map_err(|e| format!("serialize monitor policy: {e}"))?
     );
     fs::write(&path, body).map_err(|e| format!("write monitor policy {}: {e}", path.display()))
 }
@@ -219,74 +252,6 @@ pub(super) fn mark_scheduled_verify_done(
         }
     }
     write_verify_schedule_state(archive_dir, &state)
-}
-
-fn extract_json_object<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
-    let key_marker = format!("\"{key}\"");
-    let key_idx = raw.find(&key_marker)?;
-    let after_key = &raw[key_idx + key_marker.len()..];
-    let colon_idx = after_key.find(':')?;
-    let value = after_key[colon_idx + 1..].trim_start();
-    if !value.starts_with('{') {
-        return None;
-    }
-
-    let mut depth = 0usize;
-    for (idx, ch) in value.char_indices() {
-        if ch == '{' {
-            depth += 1;
-        } else if ch == '}' {
-            depth = depth.saturating_sub(1);
-            if depth == 0 {
-                return Some(&value[..=idx]);
-            }
-        }
-    }
-    None
-}
-
-fn extract_json_value_start<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
-    let key_marker = format!("\"{key}\"");
-    let key_idx = raw.find(&key_marker)?;
-    let after_key = &raw[key_idx + key_marker.len()..];
-    let colon_idx = after_key.find(':')?;
-    Some(after_key[colon_idx + 1..].trim_start())
-}
-
-fn extract_json_string_value(raw: &str, key: &str) -> Option<String> {
-    let value = extract_json_value_start(raw, key)?;
-    let stripped = value.strip_prefix('"')?;
-    let end_idx = stripped.find('"')?;
-    Some(stripped[..end_idx].to_string())
-}
-
-fn extract_json_u64_value(raw: &str, key: &str) -> Option<u64> {
-    let value = extract_json_value_start(raw, key)?;
-    let bytes = value.as_bytes();
-    let mut end = 0usize;
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == 0 {
-        return None;
-    }
-    value[..end].parse::<u64>().ok()
-}
-
-fn extract_json_i32_value(raw: &str, key: &str) -> Option<i32> {
-    let value = extract_json_value_start(raw, key)?;
-    let bytes = value.as_bytes();
-    let mut end = 0usize;
-    if bytes.first() == Some(&b'-') {
-        end = 1;
-    }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == 0 || (end == 1 && bytes.first() == Some(&b'-')) {
-        return None;
-    }
-    value[..end].parse::<i32>().ok()
 }
 
 pub(super) fn option_or_env(cli: &Cli, opt: &str, env_key: &str) -> Option<String> {

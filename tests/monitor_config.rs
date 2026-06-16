@@ -4,7 +4,33 @@ use std::fs;
 use std::path::Path;
 
 mod common;
+use common::run_cli;
 use common::{create_test_workspace, path_arg, run_cli_err};
+
+#[test]
+fn monitor_accepts_valid_persisted_config() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("valid-monitor-config")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("keys"))?;
+    let config = "{\n  \"version\": 1,\n  \"monitor\": {\n    \"interval_sec\": 1,\n    \"verify_schedule\": \"none\",\n    \"verify_every\": 0,\n    \"compress_level\": 6\n  }\n}\n";
+    let config_path = archive.join("config.json");
+    fs::write(&config_path, config)?;
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    let output = run_cli(
+        bin,
+        &home,
+        &["--archive-dir", archive_arg, "monitor", "--cycles", "1"],
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Monitor completed after 1 cycle(s)."));
+    assert_eq!(fs::read_to_string(&config_path)?, config);
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
 
 #[test]
 fn monitor_rejects_invalid_verify_schedule_without_rewriting_config() -> Result<(), Box<dyn Error>>
