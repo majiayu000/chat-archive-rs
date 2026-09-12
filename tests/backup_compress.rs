@@ -9,6 +9,88 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
+fn restore_rejects_tampered_manifest_without_writing_report() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("restore-tampered-manifest")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let restore = root.join("restore");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir)?;
+    let raw_line = "{\"type\":\"message\",\"text\":\"tamper restore check\"}";
+    fs::write(codex_dir.join("history.jsonl"), format!("{raw_line}\n"))?;
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    let restore_arg = path_arg(&restore)?;
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+        ],
+    )?;
+
+    let manifest_path = archive.join("manifests").join("manifest.tsv");
+    let original = fs::read_to_string(&manifest_path)?;
+    let mut chars: Vec<char> = original.chars().collect();
+    // Flip a hex nibble in the trailing manifest hash so the chain/hash check fails.
+    if let Some(ch) = chars.iter_mut().rev().find(|c| c.is_ascii_hexdigit()) {
+        *ch = if *ch == '0' { '1' } else { '0' };
+    } else {
+        return Err("manifest.tsv had no hex digits to corrupt".into());
+    }
+    fs::write(&manifest_path, chars.into_iter().collect::<String>())?;
+
+    let failed = run_cli_err(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "restore",
+            "--passphrase",
+            "test-passphrase",
+            "--output-dir",
+            restore_arg,
+        ],
+    )?;
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("Manifest hash mismatch") || stderr.contains("Manifest chain mismatch"),
+        "stderr did not contain verify failure:\n{stderr}"
+    );
+    assert!(
+        !restore.join("restore-report.json").exists(),
+        "restore must not emit restore-report.json after integrity failure"
+    );
+    assert!(
+        !restore.join("canonical-records.jsonl").exists(),
+        "restore must not emit canonical output after integrity failure"
+    );
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("backup-compress")?;
     let home = root.join("home");

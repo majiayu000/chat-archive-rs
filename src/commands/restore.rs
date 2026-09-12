@@ -9,6 +9,7 @@ use crate::types::{AppResult, Cli};
 use crate::utils::{expand_tilde, hex_decode_to_string, json_escape, utc_iso};
 
 use super::support::{unlock_archive_key, write_ops_error_log, write_ops_log};
+use super::verify::run_verify_once;
 
 #[derive(Debug, Clone)]
 struct RestoreStats {
@@ -49,6 +50,9 @@ pub fn cmd_restore(cli: &Cli) -> AppResult<()> {
 }
 
 fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
+    // Fail closed on integrity errors before writing any restore artifacts.
+    run_verify_once(cli)?;
+
     let archive_key = unlock_archive_key(cli)?;
     let output_dir = cli
         .options
