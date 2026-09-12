@@ -150,7 +150,7 @@ fn is_likely_complete_json_line(line: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))
+    serde_json::from_str::<serde_json::Value>(s).is_ok()
 }
 
 #[cfg(test)]
@@ -227,6 +227,39 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(!deferred);
         assert_eq!(offset, fs::metadata(&path).expect("stat").len());
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn defers_truncated_nested_json_without_trailing_newline() {
+        let dir = test_temp_dir("collector-nested-trunc");
+        let path = dir.join("source.jsonl");
+        // Truncated nested object: starts with `{` and ends with `}` but is not valid JSON.
+        // Brace-bookend heuristics would wrongly treat this as complete.
+        fs::write(&path, "{\"a\":1}\n{\"a\":{\"b\":1}").expect("write seed");
+        let source = SourceFile {
+            provider: "codex".to_string(),
+            path: path.clone(),
+        };
+
+        let (records, offset, deferred) = read_records_from_source(&source, 0).expect("read pass1");
+        assert_eq!(records.len(), 1);
+        assert_eq!(offset, "{\"a\":1}\n".len() as u64);
+        assert!(deferred);
+
+        fs::write(&path, "{\"a\":1}\n{\"a\":{\"b\":1}}\n").expect("append completion");
+        let (records2, offset2, deferred2) =
+            read_records_from_source(&source, offset).expect("read pass2");
+        assert_eq!(records2.len(), 1);
+        assert!(!deferred2);
+        let parts2: Vec<&str> = records2[0].splitn(6, '\t').collect();
+        assert_eq!(
+            hex_decode_to_string(parts2[5]).expect("hex decode2"),
+            "{\"a\":{\"b\":1}}".to_string()
+        );
+        let size2 = fs::metadata(&path).expect("stat").len();
+        assert_eq!(offset2, size2);
 
         fs::remove_dir_all(&dir).expect("cleanup");
     }
