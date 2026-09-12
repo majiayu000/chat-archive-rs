@@ -1,6 +1,6 @@
 use std::env;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::AppResult;
@@ -15,6 +15,54 @@ pub fn expand_tilde(input: &str) -> PathBuf {
         return Path::new(&home).join(rest);
     }
     PathBuf::from(input)
+}
+
+/// Join `rel` under `root`, rejecting absolute paths, empty/`.`/`..` components,
+/// and any resolved path that escapes the canonical archive root.
+pub fn resolve_archive_path(root: &Path, rel: &str) -> AppResult<PathBuf> {
+    let rel_path = Path::new(rel);
+    if rel.is_empty() || rel_path.as_os_str().is_empty() {
+        return Err("archive-relative path must not be empty".to_string());
+    }
+    if rel_path.is_absolute() {
+        return Err(format!(
+            "archive-relative path must not be absolute: {rel}"
+        ));
+    }
+
+    let mut has_normal = false;
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(_) => has_normal = true,
+            Component::CurDir | Component::ParentDir => {
+                return Err(format!(
+                    "archive-relative path must not contain '.' or '..' components: {rel}"
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "archive-relative path must not be absolute: {rel}"
+                ));
+            }
+        }
+    }
+    if !has_normal {
+        return Err(format!("archive-relative path is invalid: {rel}"));
+    }
+
+    let root_canon = root.canonicalize().map_err(|e| {
+        format!(
+            "canonicalize archive root {}: {e}",
+            root.display()
+        )
+    })?;
+    let candidate = root_canon.join(rel_path);
+    if candidate == root_canon || !candidate.starts_with(&root_canon) {
+        return Err(format!(
+            "archive-relative path escapes archive root: {rel}"
+        ));
+    }
+    Ok(candidate)
 }
 
 pub fn utc_stamp() -> String {
@@ -129,6 +177,8 @@ pub fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_hex_roundtrip() {
@@ -143,5 +193,54 @@ mod tests {
         let a = fnv1a_hex(b"abc");
         let b = fnv1a_hex(b"abc");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn resolve_archive_path_accepts_chunk_rel() {
+        let root = temp_archive("accept-chunk");
+        let resolved = resolve_archive_path(&root, "chunks/id.enc").expect("safe path");
+        let expected = root.canonicalize().unwrap().join("chunks").join("id.enc");
+        assert_eq!(resolved, expected);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_archive_path_rejects_absolute() {
+        let root = temp_archive("reject-abs");
+        let err = resolve_archive_path(&root, "/tmp/escape.enc").unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_archive_path_rejects_parent_segments() {
+        let root = temp_archive("reject-dotdot");
+        let err = resolve_archive_path(&root, "../../outside/file").unwrap_err();
+        assert!(err.contains("'.' or '..'"), "{err}");
+        let nested = resolve_archive_path(&root, "chunks/../keys/keys.env").unwrap_err();
+        assert!(nested.contains("'.' or '..'"), "{nested}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_archive_path_rejects_empty_and_dot() {
+        let root = temp_archive("reject-empty");
+        assert!(resolve_archive_path(&root, "").is_err());
+        assert!(resolve_archive_path(&root, ".").is_err());
+        assert!(resolve_archive_path(&root, "..").is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_archive(tag: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "chat-archive-rs-utils-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("temp archive");
+        path
     }
 }

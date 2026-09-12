@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::crypto::openssl_decrypt_chunk;
 use crate::storage::load_manifest_entries;
 use crate::types::{AppResult, Cli};
-use crate::utils::{expand_tilde, hex_decode_to_string, json_escape, utc_iso};
+use crate::utils::{expand_tilde, hex_decode_to_string, json_escape, resolve_archive_path, utc_iso};
 
 use super::support::{unlock_archive_key, write_ops_error_log, write_ops_log};
 
@@ -70,7 +70,7 @@ fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
     let mut total = 0usize;
     let mut unique_raw = HashSet::new();
     for m in manifests {
-        let chunk_path = cli.archive_dir.join(m.chunk_rel);
+        let chunk_path = resolve_archive_path(&cli.archive_dir, &m.chunk_rel)?;
         let cipher = fs::read(&chunk_path).map_err(|e| format!("read chunk: {e}"))?;
         let plain = openssl_decrypt_chunk(&cipher, &archive_key)?;
         for line in plain.split(|b| *b == b'\n') {

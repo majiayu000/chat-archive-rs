@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::types::{AppResult, ManifestEntry};
+use crate::utils::resolve_archive_path;
 
 const LEGACY_TSV_MIGRATION_KEY: &str = "legacy_tsv_migrated";
 const DEFAULT_DB_FILE: &str = concat!("state", ".db");
@@ -221,7 +222,7 @@ impl StateStore {
             if manifest_lines.contains(&manifest_line) {
                 continue;
             }
-            let chunk_path = root.join(&chunk_rel);
+            let chunk_path = resolve_archive_path(root, &chunk_rel)?;
             if chunk_path.exists() {
                 fs::remove_file(&chunk_path)
                     .map_err(|e| format!("remove abandoned chunk {}: {e}", chunk_path.display()))?;
@@ -697,6 +698,40 @@ mod tests {
             fs::read(remote.join("manifests").join("manifest.tsv"))?,
             b"manifest"
         );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discard_pending_backup_rejects_escaping_chunk_rel() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("discard-escape")?;
+        let archive = root.join("archive");
+        fs::create_dir_all(archive.join("chunks"))?;
+        fs::create_dir_all(archive.join("manifests"))?;
+        fs::write(archive.join("manifests").join("manifest.tsv"), b"")?;
+
+        let outside = root.join("outside.enc");
+        fs::write(&outside, b"secret")?;
+
+        let mut store = StateStore::open(&archive)?;
+        store.begin_pending_backup("op-escape")?;
+        store.stage_pending_manifest_entries(
+            "op-escape",
+            &[(
+                "../../outside.enc".to_string(),
+                "pending-escape-line".to_string(),
+            )],
+        )?;
+
+        let err = store
+            .discard_pending_backup(&archive, "op-escape")
+            .expect_err("escaping chunk_rel must fail");
+        assert!(
+            err.contains("'.' or '..'") || err.contains("escapes"),
+            "{err}"
+        );
+        assert_eq!(fs::read(&outside)?, b"secret");
 
         fs::remove_dir_all(root)?;
         Ok(())

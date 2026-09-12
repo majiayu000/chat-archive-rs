@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::crypto::{openssl_decrypt_chunk, sha256_bytes};
 use crate::storage::load_manifest_entries;
 use crate::types::{AppResult, Cli};
-use crate::utils::utc_iso;
+use crate::utils::{resolve_archive_path, utc_iso};
 
 use super::support::{unlock_archive_key, write_ops_error_log, write_ops_log};
 
@@ -67,7 +67,7 @@ pub(super) fn run_verify_once(cli: &Cli) -> AppResult<VerifyStats> {
         if chk != m.manifest_hash {
             return Err(format!("Manifest hash mismatch at entry {}", idx + 1));
         }
-        let chunk_path = cli.archive_dir.join(&m.chunk_rel);
+        let chunk_path = resolve_archive_path(&cli.archive_dir, &m.chunk_rel)?;
         if !chunk_path.exists() {
             return Err(format!("Missing chunk: {}", chunk_path.display()));
         }
