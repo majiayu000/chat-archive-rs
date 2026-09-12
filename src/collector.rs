@@ -150,7 +150,21 @@ fn is_likely_complete_json_line(line: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    serde_json::from_str::<serde_json::Value>(s).is_ok()
+    // Only object/array roots are unambiguous JSONL records without a trailing
+    // newline. Scalars like `1` can be a prefix of a longer number still being
+    // written (`123\n`), so keep them deferred until a newline arrives.
+    let looks_like_container =
+        (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'));
+    if !looks_like_container {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(_) => true,
+        // Defer only EOF/incomplete-input failures. Other parse errors mean the
+        // brace-bounded tail is already complete (possibly malformed), matching
+        // newline-terminated records which are archived without JSON validation.
+        Err(err) => !err.is_eof(),
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +274,61 @@ mod tests {
         );
         let size2 = fs::metadata(&path).expect("stat").len();
         assert_eq!(offset2, size2);
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn accepts_malformed_complete_object_tail_without_newline() {
+        let dir = test_temp_dir("collector-malformed-complete");
+        let path = dir.join("source.jsonl");
+        // Complete but malformed object: not valid JSON, yet not an incomplete write.
+        fs::write(&path, "{\"a\":}").expect("write seed");
+        let source = SourceFile {
+            provider: "codex".to_string(),
+            path: path.clone(),
+        };
+
+        let (records, offset, deferred) = read_records_from_source(&source, 0).expect("read");
+        assert_eq!(records.len(), 1);
+        assert!(!deferred);
+        assert_eq!(offset, fs::metadata(&path).expect("stat").len());
+        let parts: Vec<&str> = records[0].splitn(6, '\t').collect();
+        assert_eq!(
+            hex_decode_to_string(parts[5]).expect("hex decode"),
+            "{\"a\":}".to_string()
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn defers_numeric_scalar_tail_without_newline() {
+        let dir = test_temp_dir("collector-numeric-tail");
+        let path = dir.join("source.jsonl");
+        // A lone digit is valid JSON, but may be a prefix of a longer number.
+        fs::write(&path, "1").expect("write seed");
+        let source = SourceFile {
+            provider: "claude".to_string(),
+            path: path.clone(),
+        };
+
+        let (records, offset, deferred) = read_records_from_source(&source, 0).expect("read pass1");
+        assert!(records.is_empty());
+        assert_eq!(offset, 0);
+        assert!(deferred);
+
+        fs::write(&path, "123\n").expect("complete number");
+        let (records2, offset2, deferred2) =
+            read_records_from_source(&source, offset).expect("read pass2");
+        assert_eq!(records2.len(), 1);
+        assert!(!deferred2);
+        assert_eq!(offset2, fs::metadata(&path).expect("stat").len());
+        let parts2: Vec<&str> = records2[0].splitn(6, '\t').collect();
+        assert_eq!(
+            hex_decode_to_string(parts2[5]).expect("hex decode2"),
+            "123".to_string()
+        );
 
         fs::remove_dir_all(&dir).expect("cleanup");
     }
