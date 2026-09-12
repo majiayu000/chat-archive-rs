@@ -518,6 +518,45 @@ fn init_recovery_file_is_owner_only() -> Result<(), Box<dyn Error>> {
 
 #[cfg(unix)]
 #[test]
+fn init_keys_env_is_owner_only() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("keys-env-mode")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+
+    let keys_env = archive.join("keys").join("keys.env");
+    let mode = fs::metadata(&keys_env)?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let content = fs::read_to_string(&keys_env)?;
+    assert!(content.contains("VERSION=1"));
+    assert!(content.contains("KEY_HASH="));
+    assert!(content.contains("PASS_WRAP_B64="));
+    assert!(content.contains("REC_WRAP_B64="));
+    assert!(content.contains("CREATED_AT="));
+
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn backup_failure_does_not_advance_checkpoints() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("checkpoint-commit")?;
     let home = root.join("home");

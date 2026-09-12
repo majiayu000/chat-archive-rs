@@ -1,5 +1,4 @@
 use std::fs::{self, File};
-use std::io::Write;
 use std::time::Instant;
 
 use crate::collector::discover_sources;
@@ -26,20 +25,11 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
         let rec_wrap = openssl_wrap_b64(archive_key.as_bytes(), &recovery_code)?;
 
         let keys_path = cli.archive_dir.join("keys").join("keys.env");
-        let mut keys_file =
-            File::create(&keys_path).map_err(|e| format!("create keys file: {e}"))?;
-        writeln!(keys_file, "VERSION=1").map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "CREATED_AT={}", utc_iso()).map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "KEY_HASH={key_hash}").map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "PASS_WRAP_B64={pass_wrap}").map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "REC_WRAP_B64={rec_wrap}").map_err(|e| format!("write keys: {e}"))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&keys_path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("chmod keys: {e}"))?;
-        }
+        let keys_content = format!(
+            "VERSION=1\nCREATED_AT={}\nKEY_HASH={key_hash}\nPASS_WRAP_B64={pass_wrap}\nREC_WRAP_B64={rec_wrap}\n",
+            utc_iso()
+        );
+        write_private_file(&keys_path, keys_content.as_bytes())?;
 
         let mut state = StateStore::open(&cli.archive_dir)?;
         state.reset_for_init()?;
