@@ -1,7 +1,10 @@
-use std::env;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+
+use agent_sessions::{
+    Agent, DiscoverFilter, RawReadOptions, Roots, StreamError, discover_directory, history_files,
+    read_raw_from,
+};
 
 use crate::types::{AppResult, SourceFile};
 use crate::utils::{fnv1a_hex, hex_encode};
@@ -12,31 +15,49 @@ pub struct SourceReadStats {
 }
 
 pub fn discover_sources() -> AppResult<Vec<SourceFile>> {
-    let home = env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
+    let roots = Roots::from_env().map_err(|e| format!("resolve session directories: {e}"))?;
+    discover_sources_in(&roots)
+}
+
+fn discover_sources_in(roots: &Roots) -> AppResult<Vec<SourceFile>> {
     let mut out = Vec::new();
-
-    let codex_sessions = Path::new(&home).join(".codex").join("sessions");
-    if codex_sessions.exists() {
-        walk_jsonl("codex", &codex_sessions, &mut out)?;
+    let filter = DiscoverFilter {
+        include_subagents: true,
+        ..Default::default()
+    };
+    // Keep archive scope unchanged: Codex archived_sessions are not part of this
+    // collector. Missing session/history roots are optional on either host.
+    for (agent, root, subdir) in [
+        (Agent::Codex, &roots.codex, "sessions"),
+        (Agent::ClaudeCode, &roots.claude, "projects"),
+    ] {
+        let Some(root) = root else { continue };
+        let dir = root.join(subdir);
+        if !dir.exists() {
+            continue;
+        }
+        let discovery = discover_directory(agent, &dir, &filter);
+        if let Some(error) = discovery.errors.into_iter().next() {
+            return Err(format!(
+                "read_dir {}: {}",
+                error.path.display(),
+                error.source
+            ));
+        }
+        for file in discovery.files {
+            out.push(SourceFile {
+                provider: provider_name(file.agent)?.to_string(),
+                path: file.path,
+            });
+        }
     }
-    let codex_history = Path::new(&home).join(".codex").join("history.jsonl");
-    if codex_history.exists() {
-        out.push(SourceFile {
-            provider: "codex".to_string(),
-            path: codex_history,
-        });
-    }
-
-    let claude_projects = Path::new(&home).join(".claude").join("projects");
-    if claude_projects.exists() {
-        walk_jsonl("claude", &claude_projects, &mut out)?;
-    }
-    let claude_history = Path::new(&home).join(".claude").join("history.jsonl");
-    if claude_history.exists() {
-        out.push(SourceFile {
-            provider: "claude".to_string(),
-            path: claude_history,
-        });
+    for (agent, path) in history_files(roots) {
+        if path.exists() {
+            out.push(SourceFile {
+                provider: provider_name(agent)?.to_string(),
+                path,
+            });
+        }
     }
 
     out.sort_by(|a, b| {
@@ -77,24 +98,39 @@ where
     let start = start_offset.min(snapshot_size);
     file.seek(SeekFrom::Start(start))
         .map_err(|e| format!("seek {}: {e}", source.path.display()))?;
-    let limited = file.take(snapshot_size.saturating_sub(start));
-    let mut reader = BufReader::new(limited);
-    let mut read_offset = start;
+    // Preserve the archival reader's bounded-prefix EOF contract even if a
+    // writer truncates the source after the snapshot was taken.
+    let reader = read_raw_from(
+        BufReader::new(file.take(snapshot_size.saturating_sub(start))),
+        &RawReadOptions {
+            start_offset: start,
+            stop_at_byte: None,
+            max_read_bytes: None,
+            max_line_bytes: None,
+        },
+    )
+    .map_err(|e| format!("read_line {}: {e}", source.path.display()))?;
     let mut commit_offset = start;
     let mut deferred_partial_line = false;
-    loop {
-        let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read_line {}: {e}", source.path.display()))?;
-        if n == 0 {
-            break;
-        }
-        let line_offset = read_offset;
-        read_offset += n as u64;
-        let has_newline = line.ends_with('\n');
-        let trimmed = line.trim_end_matches(&['\n', '\r'][..]).to_string();
-        if !has_newline && !is_likely_complete_json_line(&trimmed) {
+    for record in reader {
+        let record = record.map_err(|e| {
+            let detail = match e {
+                StreamError::Io(error) => error.to_string(),
+                error => error.to_string(),
+            };
+            format!("read_line {}: {detail}", source.path.display())
+        })?;
+        let line = std::str::from_utf8(&record.bytes).map_err(|_| {
+            format!(
+                "read_line {}: stream did not contain valid UTF-8",
+                source.path.display()
+            )
+        })?;
+        let line_offset = record.byte_start;
+        let read_offset = record.byte_end;
+        let has_newline = record.terminated;
+        let trimmed = line.trim_end_matches(&['\n', '\r'][..]);
+        if !has_newline && !is_likely_complete_json_line(trimmed) {
             deferred_partial_line = true;
             break;
         }
@@ -127,22 +163,12 @@ where
     })
 }
 
-fn walk_jsonl(provider: &str, dir: &Path, out: &mut Vec<SourceFile>) -> AppResult<()> {
-    for entry in fs::read_dir(dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", dir.display()))?;
-        let path = entry.path();
-        if path.is_dir() {
-            walk_jsonl(provider, &path, out)?;
-            continue;
-        }
-        if path.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
-            out.push(SourceFile {
-                provider: provider.to_string(),
-                path,
-            });
-        }
+fn provider_name(agent: Agent) -> AppResult<&'static str> {
+    match agent {
+        Agent::ClaudeCode => Ok("claude"),
+        Agent::Codex => Ok("codex"),
+        _ => Err(format!("unsupported archive source: {agent:?}")),
     }
-    Ok(())
 }
 
 fn is_likely_complete_json_line(line: &str) -> bool {
@@ -229,5 +255,195 @@ mod tests {
         assert_eq!(offset, fs::metadata(&path).expect("stat").len());
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn preserves_unknown_malformed_and_crlf_records_and_exact_identity() {
+        let dir = test_temp_dir("collector-identity");
+        let path = dir.join("source.jsonl");
+        // These records are archival bytes, not a schema or JSON validation input.
+        let lines = [
+            "{\"type\":\"future_event\",\"text\":\"你好\"}",
+            "not json",
+            " {broken} ",
+            "[1,2]",
+        ];
+        let bytes = format!(
+            "{}\r\n\r\n{}\n{}\r\r\n{}",
+            lines[0], lines[1], lines[2], lines[3]
+        );
+        fs::write(&path, &bytes).expect("write source");
+        let source = SourceFile {
+            provider: "codex".into(),
+            path,
+        };
+        let (records, offset, deferred) =
+            read_records_from_source(&source, 0).expect("read source");
+        let offsets = [
+            0,
+            lines[0].len() + 4,
+            lines[0].len() + 4 + lines[1].len() + 1,
+            bytes.len() - lines[3].len(),
+        ];
+        let expected: Vec<String> = lines
+            .iter()
+            .zip(offsets)
+            .map(|(raw, start)| {
+                let hash = fnv1a_hex(raw.as_bytes());
+                let id =
+                    fnv1a_hex(format!("codex|{}|{start}|{hash}", source.path.display()).as_bytes());
+                format!(
+                    "{id}\tcodex\t{}\t{start}\t{hash}\t{}",
+                    hex_encode(source.path.to_string_lossy().as_bytes()),
+                    hex_encode(raw.as_bytes())
+                )
+            })
+            .collect();
+        assert_eq!(records, expected);
+        assert_eq!(offset, bytes.len() as u64);
+        assert!(!deferred);
+        // Every safe boundary resumes with the same identities and no replay.
+        for (index, start) in offsets.into_iter().enumerate() {
+            let (resumed, end, deferred) =
+                read_records_from_source(&source, start as u64).expect("resume");
+            assert_eq!(resumed, expected[index..]);
+            assert_eq!(end, offset);
+            assert!(!deferred);
+        }
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn clamps_past_eof_and_does_not_read_appended_bytes_until_next_pass() {
+        use std::io::Write;
+        let dir = test_temp_dir("collector-watermark");
+        let path = dir.join("source.jsonl");
+        let initial = "{\"a\":1}\n";
+        fs::write(&path, initial).expect("write source");
+        let source = SourceFile {
+            provider: "claude".into(),
+            path,
+        };
+        let (empty, end, deferred) = read_records_from_source(&source, u64::MAX).expect("past eof");
+        assert!(empty.is_empty());
+        assert_eq!(end, initial.len() as u64);
+        assert!(!deferred);
+        let mut count = 0;
+        let stats = stream_records_from_source(&source, 0, |_| {
+            count += 1;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&source.path)
+                .expect("append open");
+            file.write_all(b"{\"b\":2}\n").expect("append");
+            Ok(())
+        })
+        .expect("snapshot read");
+        assert_eq!(count, 1);
+        assert_eq!(stats.commit_offset, initial.len() as u64);
+        let (records, _, _) =
+            read_records_from_source(&source, stats.commit_offset).expect("next pass");
+        assert_eq!(records.len(), 1);
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn invalid_utf8_and_consumer_errors_abort_without_reading_later_records() {
+        let dir = test_temp_dir("collector-errors");
+        let path = dir.join("source.jsonl");
+        fs::write(&path, b"{}\n\xff\n{}\n").expect("write source");
+        let source = SourceFile {
+            provider: "codex".into(),
+            path,
+        };
+        let mut count = 0;
+        let error = stream_records_from_source(&source, 0, |_| {
+            count += 1;
+            Ok(())
+        })
+        .err()
+        .expect("UTF8 error");
+        assert_eq!(count, 1);
+        assert!(error.contains("read_line"));
+        assert!(error.contains("valid UTF-8"));
+        let error =
+            stream_records_from_source(&source, 0, |_| Err("archive storage unavailable".into()))
+                .err()
+                .expect("consumer error");
+        assert_eq!(error, "archive storage unavailable");
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn discovery_keeps_history_subagents_scope_and_provider_sorting() {
+        let dir = test_temp_dir("discovery");
+        let roots = Roots::from_home(&dir);
+        let expected = [
+            ("claude", ".claude/history.jsonl"),
+            ("claude", ".claude/projects/p/session/subagents/agent.jsonl"),
+            ("codex", ".codex/history.jsonl"),
+            ("codex", ".codex/sessions/2026/session.jsonl"),
+        ];
+        for (_, path) in expected.iter().chain(
+            [
+                ("codex", ".codex/archived_sessions/old.jsonl"),
+                ("claude", ".claude/projects/p/sessions-index.json"),
+            ]
+            .iter(),
+        ) {
+            let path = dir.join(path);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(path, "{}\n").expect("write");
+        }
+        let found = discover_sources_in(&roots).expect("discover");
+        let actual: Vec<_> = found
+            .iter()
+            .map(|s| (s.provider.as_str(), s.path.clone()))
+            .collect();
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|(provider, path)| (*provider, dir.join(path)))
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn discovery_allows_missing_roots_but_reports_invalid_session_directory() {
+        let dir = test_temp_dir("discovery-missing");
+        let roots = Roots::from_home(&dir);
+        assert!(
+            discover_sources_in(&roots)
+                .expect("missing is optional")
+                .is_empty()
+        );
+        fs::create_dir_all(dir.join(".codex")).expect("mkdir");
+        fs::write(dir.join(".codex/sessions"), "not a directory").expect("write");
+        let error = discover_sources_in(&roots).expect_err("invalid directory");
+        assert!(error.contains("read_dir"));
+        assert!(error.contains(".codex/sessions"));
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_symlinked_session_files_and_directories() {
+        use std::os::unix::fs::symlink;
+        let dir = test_temp_dir("discovery-symlink");
+        let sessions = dir.join(".codex/sessions");
+        fs::create_dir_all(&sessions).expect("mkdir");
+        let external = dir.join("external");
+        fs::create_dir(&external).expect("mkdir external");
+        fs::write(external.join("s.jsonl"), "{}\n").expect("write");
+        symlink(&external, sessions.join("linked-dir")).expect("link dir");
+        symlink(external.join("s.jsonl"), sessions.join("linked.jsonl")).expect("link file");
+        assert!(
+            discover_sources_in(&Roots::from_home(&dir))
+                .expect("discover")
+                .is_empty()
+        );
+        fs::remove_dir_all(dir).expect("cleanup");
     }
 }

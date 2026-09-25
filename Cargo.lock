@@ -38,6 +38,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-sessions"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "memchr",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -114,6 +124,7 @@ name = "chat-archive-rs"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "agent-sessions",
  "base64",
  "chrono",
  "pbkdf2",
@@ -133,6 +144,7 @@ checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -795,3 +807,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "ccstats"
+version = "0.9.0"

@@ -609,7 +609,12 @@ fn run_cli_with_env(
     envs: &[(&str, &str)],
 ) -> Result<Output, Box<dyn Error>> {
     let mut command = Command::new(bin);
-    command.args(args).env("HOME", home);
+    command
+        .args(args)
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("APP_DB_PATH");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -664,7 +669,12 @@ fn run_cli_err_with_env(
     envs: &[(&str, &str)],
 ) -> Result<Output, Box<dyn Error>> {
     let mut command = Command::new(bin);
-    command.args(args).env("HOME", home);
+    command
+        .args(args)
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("APP_DB_PATH");
     for (key, value) in envs {
         command.env(key, value);
     }

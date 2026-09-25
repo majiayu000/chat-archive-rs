@@ -23,7 +23,13 @@ pub fn path_arg(path: &Path) -> Result<&str, Box<dyn Error>> {
 }
 
 pub fn run_cli(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-    let output = Command::new(bin).args(args).env("HOME", home).output()?;
+    let output = Command::new(bin)
+        .args(args)
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("APP_DB_PATH")
+        .output()?;
     if output.status.success() {
         return Ok(output);
     }
@@ -42,7 +48,13 @@ pub fn run_cli(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn
 }
 
 pub fn run_cli_err(bin: &Path, home: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
-    let output = Command::new(bin).args(args).env("HOME", home).output()?;
+    let output = Command::new(bin)
+        .args(args)
+        .env("HOME", home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("APP_DB_PATH")
+        .output()?;
     if !output.status.success() {
         return Ok(output);
     }
