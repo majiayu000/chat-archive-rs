@@ -40,6 +40,8 @@ dependencies = [
 [[package]]
 name = "agent-sessions"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "741368addca6a3758a911dc5b0871df029863c67d2d2008788662586ed4748c3"
 dependencies = [
  "chrono",
  "memchr",
