@@ -9,6 +9,12 @@ Personal Codex + Claude Code chat backup tool in Rust.
 - `~/.codex/history.jsonl`
 - `~/.claude/projects/**/*.jsonl`
 - `~/.claude/history.jsonl`
+Session roots honor `CODEX_HOME` and `CLAUDE_CONFIG_DIR` when set; otherwise
+these paths use the current home directory. Empty overrides are errors. Discovery
+uses `agent-sessions`, includes subagent JSONL files and skips symbolic links in
+session directories. Codex `archived_sessions` remain outside the archive scope.
+Missing session directories or history files are optional.
+
 2. Incremental append-only backup.
 3. Local encryption before any remote sync copy.
 4. New chunks auto-compress before encryption (zstd), old chunks stay readable.
@@ -73,6 +79,13 @@ Deferred incomplete tail lines in N source file(s); will capture next backup.
 ```
 
 This is expected and prevents partial-line corruption during live writes.
+
+The shared raw reader preserves the existing archival contract: record IDs use
+the provider, source path, byte offset and original line hash. CR/LF delimiters
+are stripped as before; unknown record types and malformed newline-terminated
+records are retained. The final unterminated line uses the existing enclosing
+object/array heuristic, not schema validation. UTF-8 and storage errors still
+abort the backup before its checkpoint transaction commits.
 
 Verify:
 
