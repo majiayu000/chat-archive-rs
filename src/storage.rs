@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::types::{AppResult, ManifestEntry};
+use crate::utils::resolve_archive_path;
 
 const LEGACY_TSV_MIGRATION_KEY: &str = "legacy_tsv_migrated";
 const DEFAULT_DB_FILE: &str = concat!("state", ".db");
@@ -221,7 +222,7 @@ impl StateStore {
             if manifest_lines.contains(&manifest_line) {
                 continue;
             }
-            let chunk_path = root.join(&chunk_rel);
+            let chunk_path = resolve_archive_path(root, &chunk_rel)?;
             if chunk_path.exists() {
                 fs::remove_file(&chunk_path)
                     .map_err(|e| format!("remove abandoned chunk {}: {e}", chunk_path.display()))?;
@@ -700,6 +701,85 @@ mod tests {
 
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn discard_pending_backup_constrains_chunk_rel() {
+        let root = test_dir("discard-chunk-rel").unwrap();
+        let archive = root.join("archive");
+        fs::create_dir_all(archive.join("chunks")).unwrap();
+        fs::create_dir_all(archive.join("manifests")).unwrap();
+        fs::write(archive.join("manifests").join("manifest.tsv"), b"").unwrap();
+        let mut store = StateStore::open(&archive).unwrap();
+        let outside = root.join("outside.enc");
+        fs::write(&outside, b"secret").unwrap();
+
+        stage_pending(&mut store, "escape", "../outside.enc");
+        let err = store
+            .discard_pending_backup(&archive, "escape")
+            .unwrap_err();
+        assert!(err.contains("'.' or '..'"), "{err}");
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
+        assert_eq!(store.pending_manifest_entries("escape").unwrap().len(), 1);
+
+        let absolute = outside.to_str().unwrap();
+        stage_pending(&mut store, "absolute", absolute);
+        let err = store
+            .discard_pending_backup(&archive, "absolute")
+            .unwrap_err();
+        assert!(err.contains("absolute"), "{err}");
+        assert_eq!(fs::read(&outside).unwrap(), b"secret");
+        assert_eq!(store.pending_manifest_entries("absolute").unwrap().len(), 1);
+
+        #[cfg(unix)]
+        {
+            let outside_dir = root.join("outside");
+            fs::create_dir(&outside_dir).unwrap();
+            let secret = outside_dir.join("secret.enc");
+            fs::write(&secret, b"secret").unwrap();
+            std::os::unix::fs::symlink(&outside_dir, archive.join("linked-chunks")).unwrap();
+            stage_pending(&mut store, "symlink", "linked-chunks/secret.enc");
+            let err = store
+                .discard_pending_backup(&archive, "symlink")
+                .unwrap_err();
+            assert!(err.contains("escapes"), "{err}");
+            assert_eq!(fs::read(&secret).unwrap(), b"secret");
+            assert_eq!(store.pending_manifest_entries("symlink").unwrap().len(), 1);
+        }
+
+        let abandoned = archive.join("chunks").join("abandoned.enc");
+        fs::write(&abandoned, b"chunk").unwrap();
+        stage_pending(&mut store, "abandon", "chunks/abandoned.enc");
+        store.discard_pending_backup(&archive, "abandon").unwrap();
+        assert!(!abandoned.exists());
+        assert!(
+            store
+                .pending_manifest_entries("abandon")
+                .unwrap()
+                .is_empty()
+        );
+
+        stage_pending(&mut store, "missing", "chunks/missing.enc");
+        store.discard_pending_backup(&archive, "missing").unwrap();
+        assert!(!archive.join("chunks").join("missing.enc").exists());
+        assert!(
+            store
+                .pending_manifest_entries("missing")
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn stage_pending(store: &mut StateStore, op_id: &str, chunk_rel: &str) {
+        store.begin_pending_backup(op_id).unwrap();
+        store
+            .stage_pending_manifest_entries(
+                op_id,
+                &[(chunk_rel.into(), format!("pending-{op_id}"))],
+            )
+            .unwrap();
     }
 
     fn test_dir(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
