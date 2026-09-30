@@ -48,13 +48,14 @@ pub fn cmd_verify(cli: &Cli) -> AppResult<()> {
 pub(super) fn run_verify_once(cli: &Cli) -> AppResult<VerifyStats> {
     let archive_key = unlock_archive_key(cli)?;
     let manifests = load_manifest_entries(&cli.archive_dir)?;
-    verify_manifest_entries(&cli.archive_dir, &archive_key, &manifests)
+    verify_manifest_entries(&cli.archive_dir, &archive_key, &manifests, |_| Ok(()))
 }
 
 pub(super) fn verify_manifest_entries(
     archive_dir: &Path,
     archive_key: &str,
     manifests: &[ManifestEntry],
+    mut consume_cipher: impl FnMut(&[u8]) -> AppResult<()>,
 ) -> AppResult<VerifyStats> {
     let mut prev = "-".to_string();
     let mut total = 0usize;
@@ -104,6 +105,7 @@ pub(super) fn verify_manifest_entries(
         }
         total += count;
         prev = m.manifest_hash.clone();
+        consume_cipher(&cipher)?;
     }
 
     Ok(VerifyStats {
