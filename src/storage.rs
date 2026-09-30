@@ -639,6 +639,13 @@ fn copy_dir_files(src_dir: &Path, dst_dir: &Path, label: &str) -> AppResult<()> 
     {
         let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", src_dir.display()))?;
         let path = entry.path();
+        if label == "keys" {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".keys.env.init-") && name.ends_with(".tmp") {
+                continue;
+            }
+        }
         if path.is_file() {
             copy_file_to_dir(&path, dst_dir, label)?;
         }
@@ -723,6 +730,26 @@ mod tests {
         for file in files {
             assert_eq!(fs::read(remote.join(file))?, b"incoming archive");
         }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_excludes_private_init_stages() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-private-init-stages")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        ensure_layout(&archive)?;
+        fs::write(archive.join("keys/keys.env"), b"published keys")?;
+        fs::write(
+            archive.join("keys/.keys.env.init-abandoned.tmp"),
+            b"abandoned stage fixture",
+        )?;
+        fs::write(archive.join("keys/other.env"), b"other key file")?;
+        sync_to_remote(&archive, &remote, None)?;
+        assert!(!remote.join("keys/.keys.env.init-abandoned.tmp").exists());
+        assert_eq!(fs::read(remote.join("keys/keys.env"))?, b"published keys");
+        assert_eq!(fs::read(remote.join("keys/other.env"))?, b"other key file");
         fs::remove_dir_all(root)?;
         Ok(())
     }

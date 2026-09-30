@@ -193,6 +193,65 @@ fn init_can_be_retried_after_recovery_file_failure() -> Result<(), Box<dyn Error
 
 #[cfg(unix)]
 #[test]
+fn init_restores_owner_permissions_under_restrictive_umask() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = create_test_workspace("init-owner-umask")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    // Precreate the layout so this test isolates key permissions from umask
+    // restrictions on directories, the persistent lock and SQLite's own files.
+    for rel in ["chunks", "manifests", "state", "keys", "tmp", "remote_sync"] {
+        fs::create_dir_all(archive.join(rel))?;
+    }
+    fs::write(archive.join("state/init.lock"), b"")?;
+    let db = rusqlite::Connection::open(archive.join("state/state.db"))?;
+    drop(db);
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let output = Command::new("sh")
+        .args(["-c", "umask 0666; exec \"$@\"", "init-umask-test"])
+        .arg(bin)
+        .args([
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ])
+        .env("HOME", &home)
+        .env_remove("APP_DB_PATH")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::metadata(archive.join("keys/keys.env"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "recovery-test",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("init-process-termination")?;
     let home = root.join("home");
@@ -293,6 +352,15 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
         String::from_utf8_lossy(&concurrent.stderr)
             .contains("archive initialization already in progress")
     );
+    let abandoned_stage = fs::read_dir(archive.join("keys"))?
+        .next()
+        .unwrap()?
+        .file_name();
+    assert!(
+        abandoned_stage
+            .to_string_lossy()
+            .starts_with(".keys.env.init-")
+    );
     fs::remove_file(&recovery_file)?;
     run_cli(
         bin,
@@ -321,6 +389,29 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
         ],
     )?;
     assert_eq!(fs::read(recovery_file)?, b"test-recovery-code\n");
+    let remote = root.join("retried-remote");
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+            "--remote-dir",
+            path_arg(&remote)?,
+        ],
+    )?;
+    assert!(
+        !remote.join("keys").join(&abandoned_stage).exists(),
+        "remote sync published the killed init's staged key"
+    );
+    assert_eq!(fs::read_dir(remote.join("keys"))?.count(), 1);
+    assert_eq!(
+        fs::read(archive.join("keys/keys.env"))?,
+        fs::read(remote.join("keys/keys.env"))?
+    );
     fs::remove_dir_all(root)?;
     Ok(())
 }

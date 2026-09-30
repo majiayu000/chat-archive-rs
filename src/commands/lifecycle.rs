@@ -56,6 +56,15 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             .open(&staged_keys_path)
             .map_err(|e| format!("create staged keys: {e}"))?;
         let init_result: AppResult<()> = (|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Creation stays private even with a permissive umask; restore
+                // owner access before writing bytes if the umask masked it.
+                keys_file
+                    .set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("chmod keys: {e}"))?;
+            }
             let body = format!(
                 "VERSION=1\nCREATED_AT={}\nKEY_HASH={key_hash}\nPASS_WRAP_B64={pass_wrap}\nREC_WRAP_B64={rec_wrap}\n",
                 utc_iso()
@@ -138,6 +147,13 @@ fn rename_keys_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        // Rust canonicalization supplies absolute extended-length Windows
+        // paths. Only the destination's parent exists before publication.
+        let from = fs::canonicalize(from)?;
+        let to =
+            fs::canonicalize(to.with_file_name("."))?.join(to.file_name().ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidInput, "key destination has no filename")
+            })?);
         let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
         let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
         // SAFETY: both buffers remain alive and are NUL-terminated paths. Zero
@@ -215,5 +231,41 @@ pub fn cmd_recovery_test(cli: &Cli) -> AppResult<()> {
             write_ops_error_log(cli, "recovery-test", &started_at, elapsed_ms, &err);
             Err(err)
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn key_publication_handles_long_absolute_and_relative_paths_without_replacement()
+    -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let relative_root = Path::new("target").join(format!("init-long-path-{nonce}"));
+        let mut directory = relative_root.clone();
+        for _ in 0..4 {
+            directory = directory.join("deep-directory-".repeat(6));
+        }
+        fs::create_dir_all(&directory)?;
+        for directory in [directory.clone(), std::env::current_dir()?.join(directory)] {
+            assert!(directory.as_os_str().len() > 260);
+            let staged = directory.join(".keys.env.init-test.tmp");
+            let published = directory.join("keys.env");
+            fs::write(&staged, b"first key fixture")?;
+            rename_keys_no_replace(&staged, &published)?;
+            assert!(!staged.exists());
+            assert_eq!(fs::read(&published)?, b"first key fixture");
+            fs::write(&staged, b"second key fixture")?;
+            assert!(rename_keys_no_replace(&staged, &published).is_err());
+            assert_eq!(fs::read(&published)?, b"first key fixture");
+            assert_eq!(fs::read(&staged)?, b"second key fixture");
+            fs::remove_file(staged)?;
+            fs::remove_file(published)?;
+        }
+        fs::remove_dir_all(relative_root)?;
+        Ok(())
     }
 }
