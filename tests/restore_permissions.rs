@@ -4,6 +4,7 @@ mod common;
 
 use std::error::Error;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -60,12 +61,16 @@ fn restore_outputs_are_owner_only_when_created_and_reused() -> Result<(), Box<dy
         "restore-report.json",
     ];
     let mut modes = Vec::new();
+    let stale_output = b"stale output that must be replaced\n";
+    let mut retained_outputs = Vec::new();
     for reused in [false, true] {
+        let mut old_descriptors = Vec::new();
         if reused {
             for name in files {
                 let path = restore.join(name);
-                fs::write(&path, b"stale output that must be replaced\n")?;
-                fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+                fs::write(&path, stale_output)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+                old_descriptors.push((name, fs::File::open(path)?));
             }
         }
         // Set the umask in the child only; the parallel test process is unaffected.
@@ -98,6 +103,11 @@ fn restore_outputs_are_owner_only_when_created_and_reused() -> Result<(), Box<dy
                 fs::metadata(restore.join(name))?.permissions().mode() & 0o777,
             ));
         }
+        for (name, mut file) in old_descriptors {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            retained_outputs.push((name, bytes));
+        }
         for (provider, raw) in raw_lines {
             assert_eq!(
                 fs::read_to_string(restore.join(format!("{provider}-raw.jsonl")))?,
@@ -128,6 +138,11 @@ fn restore_outputs_are_owner_only_when_created_and_reused() -> Result<(), Box<dy
         .map(|(reused, name, _)| (*reused, *name, 0o600))
         .collect();
     assert_eq!(modes, expected);
+    let expected: Vec<_> = files
+        .iter()
+        .map(|name| (*name, stale_output.to_vec()))
+        .collect();
+    assert_eq!(retained_outputs, expected);
     Ok(())
 }
 
@@ -184,6 +199,13 @@ fn restore_output_open_failures_keep_the_error_contract() -> Result<(), Box<dyn 
         assert_eq!(log["operation"], "restore");
         assert_eq!(log["status"], "error");
         assert!(log["error"].as_str().unwrap().starts_with(context));
+        assert!(fs::read_dir(&restore)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".chat-archive-rs-restore-")
+        }));
     }
     fs::remove_dir_all(root)?;
     Ok(())

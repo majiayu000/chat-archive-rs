@@ -51,21 +51,35 @@ pub fn cmd_restore(cli: &Cli) -> AppResult<()> {
 }
 
 fn create_private_output(path: &std::path::Path) -> std::io::Result<File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let stage = path.with_file_name(format!(
+            ".chat-archive-rs-restore-{}.tmp",
+            crate::utils::random_hex(16).map_err(std::io::Error::other)?
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
         options.mode(0o600);
+        let file = options.open(&stage)?;
+        // A fresh inode keeps previously opened outputs from seeing new plaintext.
+        let result = file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .and_then(|()| fs::rename(&stage, path));
+        if let Err(err) = result {
+            fs::remove_file(&stage).map_err(|cleanup| {
+                std::io::Error::other(format!("{err}; remove restore output stage: {cleanup}"))
+            })?;
+            return Err(err);
+        }
+        Ok(file)
     }
-    let file = options.open(path)?;
-    #[cfg(unix)]
+
+    #[cfg(not(unix))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // Opening an existing file keeps its mode; restrict it before writing.
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        File::create(path)
     }
-    Ok(file)
 }
 
 fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
