@@ -6,6 +6,153 @@ use std::process::{Command, Stdio};
 mod common;
 use common::{create_test_workspace, path_arg, run_cli, run_cli_err};
 
+fn assert_init_retry(
+    bin: &Path,
+    home: &Path,
+    archive: &Path,
+    recovery_file: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    assert!(!archive.join("keys/keys.env").exists());
+    assert!(!archive.join("manifests/manifest.tsv").exists());
+    assert_eq!(fs::read_dir(archive.join("keys"))?.count(), 0);
+    let mut args = vec![
+        "--archive-dir",
+        path_arg(archive)?,
+        "init",
+        "--passphrase",
+        "test-passphrase",
+        "--recovery-code",
+        "test-recovery-code",
+    ];
+    if let Some(path) = recovery_file {
+        args.extend(["--recovery-file", path_arg(path)?]);
+    }
+    run_cli(bin, home, &args)?;
+    run_cli(
+        bin,
+        home,
+        &[
+            "--archive-dir",
+            path_arg(archive)?,
+            "recovery-test",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+    assert_eq!(fs::read(archive.join("manifests/manifest.tsv"))?, b"");
+    if let Some(path) = recovery_file {
+        assert_eq!(fs::read(path)?, b"test-recovery-code\n");
+    }
+    Ok(())
+}
+
+#[test]
+fn init_can_be_retried_after_state_open_failure() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("init-state-open-failure")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let db_path = archive.join("state/state.db");
+    fs::create_dir_all(&db_path)?;
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let failed = run_cli_err(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("open state db"));
+    fs::remove_dir(&db_path)?;
+    assert_init_retry(bin, &home, &archive, None)?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn init_can_be_retried_after_state_reset_failure() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("init-state-reset-failure")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("state"))?;
+    let db = rusqlite::Connection::open(archive.join("state/state.db"))?;
+    db.execute_batch(
+        "CREATE TABLE state_meta (
+             archive_key TEXT, key TEXT, value TEXT, PRIMARY KEY(archive_key, key)
+         );
+         CREATE TABLE checkpoints (
+             archive_key TEXT, path TEXT, offset INTEGER, PRIMARY KEY(archive_key, path)
+         );
+         CREATE TRIGGER reject_reset BEFORE DELETE ON checkpoints
+         BEGIN SELECT RAISE(ABORT, 'test reset failure'); END;",
+    )?;
+    let archive_key = archive.canonicalize()?.to_string_lossy().into_owned();
+    db.execute(
+        "INSERT INTO state_meta VALUES(?1, 'legacy_tsv_migrated', '1')",
+        [&archive_key],
+    )?;
+    db.execute(
+        "INSERT INTO checkpoints VALUES(?1, 'test-source', 42)",
+        [&archive_key],
+    )?;
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let failed = run_cli_err(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("reset checkpoints"));
+    let offset: i64 = db.query_row("SELECT offset FROM checkpoints", [], |row| row.get(0))?;
+    assert_eq!(offset, 42);
+    db.execute_batch("DROP TRIGGER reject_reset")?;
+    assert_init_retry(bin, &home, &archive, None)?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn init_can_be_retried_after_recovery_file_failure() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("init-recovery-file-failure")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let recovery_file = root.join("recovery-code");
+    fs::create_dir(&recovery_file)?;
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let failed = run_cli_err(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+            "--recovery-file",
+            path_arg(&recovery_file)?,
+        ],
+    )?;
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("private file"));
+    fs::remove_dir(&recovery_file)?;
+    assert_init_retry(bin, &home, &archive, Some(&recovery_file))?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
 #[test]
 fn init_rejects_existing_archive_without_losing_backups() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("init-existing")?;

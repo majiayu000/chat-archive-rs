@@ -40,7 +40,6 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
         let pass_wrap = openssl_wrap_b64(archive_key.as_bytes(), &passphrase)?;
         let rec_wrap = openssl_wrap_b64(archive_key.as_bytes(), &recovery_code)?;
 
-        let keys_temp = keys_path.with_file_name(format!("keys-{}.env.tmp", random_hex(8)?));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -48,10 +47,12 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        // Exclusive creation claims this init's files without requiring hard-link support.
         let mut keys_file = options
-            .open(&keys_temp)
-            .map_err(|e| format!("create keys temp: {e}"))?;
-        let keys_result: AppResult<()> = (|| {
+            .open(&keys_path)
+            .map_err(|e| format!("create keys: {e}"))?;
+        let mut manifest_created = false;
+        let init_result: AppResult<()> = (|| {
             let body = format!(
                 "VERSION=1\nCREATED_AT={}\nKEY_HASH={key_hash}\nPASS_WRAP_B64={pass_wrap}\nREC_WRAP_B64={rec_wrap}\n",
                 utc_iso()
@@ -62,32 +63,39 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             keys_file
                 .sync_all()
                 .map_err(|e| format!("sync keys: {e}"))?;
-            // Publish the complete file atomically without replacing a concurrent init's keys.
-            fs::hard_link(&keys_temp, &keys_path).map_err(|e| format!("publish keys: {e}"))
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&manifest_path)
+                .map_err(|e| format!("create manifest: {e}"))?;
+            manifest_created = true;
+
+            let mut state = StateStore::open(&cli.archive_dir)?;
+            state.reset_for_init()?;
+
+            if let Some(recovery_file) = cli.options.get("--recovery-file") {
+                let p = expand_tilde(recovery_file);
+                if let Some(parent) = p.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("mkdir recovery file parent: {e}"))?;
+                }
+                write_private_file(&p, format!("{recovery_code}\n").as_bytes())?;
+            }
+
+            Ok(())
         })();
         drop(keys_file);
-        fs::remove_file(&keys_temp).map_err(|e| match &keys_result {
-            Ok(()) => format!("remove keys temp: {e}"),
-            Err(err) => format!("{err}; remove keys temp: {e}"),
-        })?;
-        keys_result?;
-
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&manifest_path)
-            .map_err(|e| format!("create manifest: {e}"))?;
-
-        let mut state = StateStore::open(&cli.archive_dir)?;
-        state.reset_for_init()?;
-
-        if let Some(recovery_file) = cli.options.get("--recovery-file") {
-            let p = expand_tilde(recovery_file);
-            if let Some(parent) = p.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("mkdir recovery file parent: {e}"))?;
+        if let Err(mut err) = init_result {
+            // Remove only files this invocation created; a losing concurrent init owns none.
+            for (path, created) in [(&manifest_path, manifest_created), (&keys_path, true)] {
+                if created && let Err(cleanup_err) = fs::remove_file(path) {
+                    err.push_str(&format!(
+                        "; remove failed init file {}: {cleanup_err}",
+                        path.display()
+                    ));
+                }
             }
-            write_private_file(&p, format!("{recovery_code}\n").as_bytes())?;
+            return Err(err);
         }
 
         println!("Archive initialized: {}", cli.archive_dir.display());
