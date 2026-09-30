@@ -268,6 +268,107 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn init_preserves_destination_created_before_publication() -> Result<(), Box<dyn Error>> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    for dangling_symlink in [false, true] {
+        let root = create_test_workspace("init-publication-race")?;
+        let home = root.join("home");
+        let archive = root.join("archive");
+        let recovery_file = root.join("recovery-code");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&recovery_file)
+                .status()?
+                .success()
+        );
+        let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+        let mut child = Command::new(bin)
+            .args([
+                "--archive-dir",
+                path_arg(&archive)?,
+                "init",
+                "--passphrase",
+                "test-passphrase",
+                "--recovery-code",
+                "test-recovery-code",
+                "--recovery-file",
+                path_arg(&recovery_file)?,
+            ])
+            .env("HOME", &home)
+            .env_remove("APP_DB_PATH")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let ready = loop {
+            if child.try_wait()?.is_some() || Instant::now() >= deadline {
+                break false;
+            }
+            let db_path = archive.join("state/state.db");
+            if db_path.is_file()
+                && let Ok(db) = rusqlite::Connection::open_with_flags(
+                    &db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                && db
+                    .query_row("SELECT value FROM state_meta", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .is_ok_and(|value| value == "1")
+            {
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !ready {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("init did not reach database initialization".into());
+        }
+        let staged = fs::read_dir(archive.join("keys"))?.next().unwrap()?.path();
+        let staged_metadata = fs::metadata(&staged)?;
+        assert!(staged_metadata.len() > 0);
+        assert_eq!(staged_metadata.mode() & 0o777, 0o600);
+        let keys_path = archive.join("keys/keys.env");
+        let missing_target = root.join("missing-key");
+        let original = b"key created by a concurrent external writer\n";
+        if dangling_symlink {
+            symlink(&missing_target, &keys_path)?;
+        } else {
+            fs::write(&keys_path, original)?;
+        }
+        let original_inode = fs::symlink_metadata(&keys_path)?.ino();
+        // Unblock recovery-file writing only after the external destination exists.
+        let mut fifo = OpenOptions::new().read(true).open(&recovery_file)?;
+        let mut recovery = Vec::new();
+        fifo.read_to_end(&mut recovery)?;
+        let output = child.wait_with_output()?;
+        assert_eq!(recovery, b"test-recovery-code\n");
+        assert!(
+            !output.status.success(),
+            "init overwrote a concurrent destination"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("publish keys"));
+        assert_eq!(fs::symlink_metadata(&keys_path)?.ino(), original_inode);
+        if dangling_symlink {
+            assert_eq!(fs::read_link(&keys_path)?, missing_target);
+            assert!(!missing_target.exists());
+        } else {
+            assert_eq!(fs::read(&keys_path)?, original);
+        }
+        assert!(!staged.exists());
+        assert_eq!(fs::read_dir(archive.join("keys"))?.count(), 1);
+        assert!(!archive.join("manifests/manifest.tsv").exists());
+        fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn init_rejects_existing_archive_without_losing_backups() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("init-existing")?;

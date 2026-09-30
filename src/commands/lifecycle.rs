@@ -1,5 +1,6 @@
 use std::fs::{self, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::collector::discover_sources;
@@ -98,7 +99,8 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
         // empty archives and the first backup creates one. No final marker is
         // visible until all other fallible initialization work has succeeded.
         let init_result = init_result.and_then(|()| {
-            fs::rename(&staged_keys_path, &keys_path).map_err(|e| format!("publish keys: {e}"))
+            rename_keys_no_replace(&staged_keys_path, &keys_path)
+                .map_err(|e| format!("publish keys: {e}"))
         });
         if let Err(mut err) = init_result {
             if let Err(cleanup_err) = fs::remove_file(&staged_keys_path) {
@@ -132,6 +134,47 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             write_ops_error_log(cli, "init", &started_at, elapsed_ms, &err);
             Err(err)
         }
+    }
+}
+
+fn rename_keys_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(Into::into)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both buffers remain alive and are NUL-terminated paths. Zero
+        // flags forbids replacement and cross-volume copy/delete publication.
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox",
+        windows
+    )))]
+    {
+        let _ = (from, to);
+        Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "atomic no-replace key publication is unsupported on this platform",
+        ))
     }
 }
 

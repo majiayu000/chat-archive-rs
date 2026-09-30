@@ -53,8 +53,10 @@ chat-archive-rs --archive-dir ~/.chat-archive-rs init \
 
 `init` refuses an archive directory that already contains `keys/keys.env` or
 `manifests/manifest.tsv`. Use a new archive directory to initialize a separate archive.
-Initialization stages and syncs the key, then publishes `keys/keys.env` by rename
-only after database and optional recovery-file work succeeds. The first backup
+Initialization stages and syncs the key, then publishes `keys/keys.env` by atomic
+no-replace rename only after database and optional recovery-file work succeeds.
+A destination created during initialization is preserved and publication fails;
+filesystems without atomic no-replace rename support report an error. The first backup
 with new records creates the manifest; until then, the archive is empty. Concurrent
 initialization is refused while another init holds the archive's file lock.
 Termination before publication leaves no final archive marker, so you can retry;
