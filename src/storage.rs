@@ -880,6 +880,7 @@ mod tests {
         assert!(store.has_seen_id("second-id")?);
         assert_eq!(store.checkpoint("source.jsonl")?, Some(42));
         assert!(store.pending_backup_op_ids()?.is_empty());
+        drop(store);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -920,6 +921,7 @@ mod tests {
             tx.commit()?;
         }
         assert_eq!(fs::read(&outside)?, b"cipher");
+        drop(store);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -931,7 +933,7 @@ mod tests {
         let archive = root.join("archive");
         ensure_layout(&archive)?;
         let chunk_rel = "chunks/readonly.enc";
-        let chunk_path = archive.join(chunk_rel);
+        let chunk_path = archive.join("chunks").join("readonly.enc");
         let manifest_path = archive.join("manifests/manifest.tsv");
         let entries = [(
             chunk_rel.to_string(),
@@ -939,6 +941,13 @@ mod tests {
         )];
         fs::write(&chunk_path, b"cipher")?;
         fs::write(&manifest_path, format!("{}\n", entries[0].1))?;
+        for path in [&chunk_path, &manifest_path] {
+            // A read-only handle cannot call FlushFileBuffers on Windows,
+            // even while the file itself is writable.
+            let err = File::open(path)?.sync_all().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            File::options().write(true).open(path)?.sync_all()?;
+        }
         let mut store = StateStore::open(&archive)?;
         store.begin_pending_backup("recover")?;
         store.stage_pending_seen_id("recover", "must-not-skip")?;
