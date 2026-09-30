@@ -1,6 +1,11 @@
 # chat-archive-rs
 
-Personal Codex + Claude Code chat backup tool in Rust.
+A Rust CLI for incremental, encrypted backups of local Codex and Claude Code
+JSONL history. Verify archive integrity and restore records without depending
+on the original terminal session.
+
+[Build and install](#build) · [Usage](#usage) ·
+[Report an issue](https://github.com/majiayu000/chat-archive-rs/issues)
 
 ## Features
 
@@ -31,17 +36,16 @@ Missing session directories or history files are optional.
 ## Build
 
 ```bash
-cd /Users/lifcc/Desktop/code/work/infra/chat-archive-rs
-cargo build
+git clone https://github.com/majiayu000/chat-archive-rs.git
+cd chat-archive-rs
+cargo install --locked --path .
 ```
 
 ## Usage
 
-Binary path:
-
-```bash
-/Users/lifcc/Desktop/code/work/infra/chat-archive-rs/target/debug/chat-archive-rs
-```
+`cargo install` puts `chat-archive-rs` in Cargo's binary directory (normally
+`~/.cargo/bin`); make sure that directory is on `PATH`. For development, use
+`cargo build --locked` and `./target/debug/chat-archive-rs`.
 
 Initialize:
 
