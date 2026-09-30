@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::time::Instant;
 
 use crate::collector::discover_sources;
@@ -15,6 +15,21 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
     let timer = Instant::now();
 
     let result: AppResult<()> = (|| -> AppResult<()> {
+        let keys_path = cli.archive_dir.join("keys").join("keys.env");
+        let manifest_path = cli.archive_dir.join("manifests").join("manifest.tsv");
+        for path in [&keys_path, &manifest_path] {
+            match path.symlink_metadata() {
+                Ok(_) => {
+                    return Err(format!(
+                        "refusing to initialize: {} already exists; use a new archive directory",
+                        path.display()
+                    ));
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("stat archive file {}: {err}", path.display())),
+            }
+        }
+
         let passphrase = option_or_env(cli, "--passphrase", "ARCHIVE_PASSPHRASE")
             .ok_or_else(|| "init requires --passphrase or ARCHIVE_PASSPHRASE".to_string())?;
         let recovery_code = option_or_env(cli, "--recovery-code", "ARCHIVE_RECOVERY_CODE")
@@ -25,26 +40,46 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
         let pass_wrap = openssl_wrap_b64(archive_key.as_bytes(), &passphrase)?;
         let rec_wrap = openssl_wrap_b64(archive_key.as_bytes(), &recovery_code)?;
 
-        let keys_path = cli.archive_dir.join("keys").join("keys.env");
-        let mut keys_file =
-            File::create(&keys_path).map_err(|e| format!("create keys file: {e}"))?;
-        writeln!(keys_file, "VERSION=1").map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "CREATED_AT={}", utc_iso()).map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "KEY_HASH={key_hash}").map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "PASS_WRAP_B64={pass_wrap}").map_err(|e| format!("write keys: {e}"))?;
-        writeln!(keys_file, "REC_WRAP_B64={rec_wrap}").map_err(|e| format!("write keys: {e}"))?;
-
+        let keys_temp = keys_path.with_file_name(format!("keys-{}.env.tmp", random_hex(8)?));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&keys_path, fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("chmod keys: {e}"))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut keys_file = options
+            .open(&keys_temp)
+            .map_err(|e| format!("create keys temp: {e}"))?;
+        let keys_result: AppResult<()> = (|| {
+            let body = format!(
+                "VERSION=1\nCREATED_AT={}\nKEY_HASH={key_hash}\nPASS_WRAP_B64={pass_wrap}\nREC_WRAP_B64={rec_wrap}\n",
+                utc_iso()
+            );
+            keys_file
+                .write_all(body.as_bytes())
+                .map_err(|e| format!("write keys: {e}"))?;
+            keys_file
+                .sync_all()
+                .map_err(|e| format!("sync keys: {e}"))?;
+            // Publish the complete file atomically without replacing a concurrent init's keys.
+            fs::hard_link(&keys_temp, &keys_path).map_err(|e| format!("publish keys: {e}"))
+        })();
+        drop(keys_file);
+        fs::remove_file(&keys_temp).map_err(|e| match &keys_result {
+            Ok(()) => format!("remove keys temp: {e}"),
+            Err(err) => format!("{err}; remove keys temp: {e}"),
+        })?;
+        keys_result?;
+
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_path)
+            .map_err(|e| format!("create manifest: {e}"))?;
 
         let mut state = StateStore::open(&cli.archive_dir)?;
         state.reset_for_init()?;
-        File::create(cli.archive_dir.join("manifests").join("manifest.tsv"))
-            .map_err(|e| format!("create manifest: {e}"))?;
 
         if let Some(recovery_file) = cli.options.get("--recovery-file") {
             let p = expand_tilde(recovery_file);

@@ -51,6 +51,9 @@ chat-archive-rs --archive-dir ~/.chat-archive-rs init \
   --recovery-code 'YOUR-RECOVERY-CODE'
 ```
 
+`init` refuses an archive directory that already contains `keys/keys.env` or
+`manifests/manifest.tsv`. Use a new archive directory to initialize a separate archive.
+
 Backup:
 
 ```bash
