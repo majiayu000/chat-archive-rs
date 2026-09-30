@@ -50,6 +50,24 @@ pub fn cmd_restore(cli: &Cli) -> AppResult<()> {
     }
 }
 
+fn create_private_output(path: &std::path::Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Opening an existing file keeps its mode; restrict it before writing.
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
     let archive_key = unlock_archive_key(cli)?;
     let output_dir = cli
@@ -61,9 +79,11 @@ fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
     let canonical = output_dir.join("canonical-records.jsonl");
     let codex_raw = output_dir.join("codex-raw.jsonl");
     let claude_raw = output_dir.join("claude-raw.jsonl");
-    let canonical_file = File::create(&canonical).map_err(|e| format!("reset canonical: {e}"))?;
-    let codex_file = File::create(&codex_raw).map_err(|e| format!("reset codex: {e}"))?;
-    let claude_file = File::create(&claude_raw).map_err(|e| format!("reset claude: {e}"))?;
+    let canonical_file =
+        create_private_output(&canonical).map_err(|e| format!("reset canonical: {e}"))?;
+    let codex_file = create_private_output(&codex_raw).map_err(|e| format!("reset codex: {e}"))?;
+    let claude_file =
+        create_private_output(&claude_raw).map_err(|e| format!("reset claude: {e}"))?;
     let mut canonical_writer = BufWriter::with_capacity(8 * 1024 * 1024, canonical_file);
     let mut codex_writer = BufWriter::with_capacity(4 * 1024 * 1024, codex_file);
     let mut claude_writer = BufWriter::with_capacity(4 * 1024 * 1024, claude_file);
@@ -138,7 +158,8 @@ fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
         json_escape(&codex_raw.to_string_lossy()),
         json_escape(&claude_raw.to_string_lossy())
     );
-    fs::write(output_dir.join("restore-report.json"), report)
+    create_private_output(&output_dir.join("restore-report.json"))
+        .and_then(|mut file| file.write_all(report.as_bytes()))
         .map_err(|e| format!("write restore report: {e}"))?;
 
     Ok(RestoreStats {
