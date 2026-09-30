@@ -11,6 +11,7 @@ use crate::utils::{
 };
 
 use super::support::{unlock_archive_key, write_ops_error_log, write_ops_log};
+use super::verify::verify_manifest_entries;
 
 #[derive(Debug, Clone)]
 struct RestoreStats {
@@ -57,6 +58,8 @@ fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
         .get("--output-dir")
         .map(|s| expand_tilde(s))
         .ok_or_else(|| "restore requires --output-dir".to_string())?;
+    let manifests = load_manifest_entries(&cli.archive_dir)?;
+    verify_manifest_entries(&cli.archive_dir, &archive_key, &manifests)?;
     fs::create_dir_all(&output_dir).map_err(|e| format!("create output dir: {e}"))?;
     let canonical = output_dir.join("canonical-records.jsonl");
     let codex_raw = output_dir.join("codex-raw.jsonl");
@@ -68,7 +71,6 @@ fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
     let mut codex_writer = BufWriter::with_capacity(4 * 1024 * 1024, codex_file);
     let mut claude_writer = BufWriter::with_capacity(4 * 1024 * 1024, claude_file);
 
-    let manifests = load_manifest_entries(&cli.archive_dir)?;
     let mut total = 0usize;
     let mut unique_raw = HashSet::new();
     for m in manifests {
