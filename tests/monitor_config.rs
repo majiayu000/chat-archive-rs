@@ -12,17 +12,37 @@ fn monitor_accepts_valid_persisted_config() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("valid-monitor-config")?;
     let home = root.join("home");
     let archive = root.join("archive");
-    fs::create_dir_all(archive.join("keys"))?;
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
     let config = "{\n  \"version\": 1,\n  \"monitor\": {\n    \"interval_sec\": 1,\n    \"verify_schedule\": \"none\",\n    \"verify_every\": 0,\n    \"compress_level\": 6\n  }\n}\n";
     let config_path = archive.join("config.json");
     fs::write(&config_path, config)?;
 
-    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
-    let archive_arg = path_arg(&archive)?;
     let output = run_cli(
         bin,
         &home,
-        &["--archive-dir", archive_arg, "monitor", "--cycles", "1"],
+        &[
+            "--archive-dir",
+            archive_arg,
+            "monitor",
+            "--passphrase",
+            "test-passphrase",
+            "--cycles",
+            "1",
+        ],
     )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Monitor completed after 1 cycle(s)."));

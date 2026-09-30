@@ -151,6 +151,11 @@ chat-archive-rs --archive-dir ~/.chat-archive-rs monitor \
   --cycles 1
 ```
 
+With a positive `--cycles` count, monitor completes all requested cycles and exits
+nonzero if any backup or verification failed, reporting the first error even if
+a later cycle succeeds. With `--cycles 0` (the default), monitor continues after
+backup or verification failures. Each failure is still printed and logged.
+
 Structured runtime logs are appended to:
 
 ```text
