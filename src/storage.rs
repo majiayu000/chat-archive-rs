@@ -859,7 +859,15 @@ mod tests {
             fs::read(remote.join("config.json/sentinel"))?,
             b"keep config"
         );
-        assert_eq!(fs::read_dir(&remote)?.count(), 4);
+        for entry in fs::read_dir(&remote)? {
+            assert!(
+                !entry?
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chat-archive-rs-sync-"),
+                "failed config publication left a temporary copy"
+            );
+        }
 
         let missing_chunk = root.join("missing.enc");
         let err = sync_to_remote(&archive, &remote, Some(&missing_chunk)).unwrap_err();
