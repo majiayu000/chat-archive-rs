@@ -1,11 +1,11 @@
-use std::fs::{self, OpenOptions, TryLockError};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::time::Instant;
 
 use crate::collector::discover_sources;
 use crate::crypto::{openssl_unwrap_b64, openssl_wrap_b64, sha256_bytes};
-use crate::storage::{StateStore, load_env_file};
+use crate::storage::{StateStore, load_env_file, lock_archive_publication};
 use crate::types::{AppResult, Cli};
 use crate::utils::{expand_tilde, random_hex, utc_iso, write_private_file};
 
@@ -16,21 +16,7 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
     let timer = Instant::now();
 
     let result: AppResult<()> = (|| -> AppResult<()> {
-        // Keep this file in place: deleting a locked file would let another init
-        // lock a different inode. Closing the handle also releases it after a kill.
-        let init_lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(cli.archive_dir.join("state/init.lock"))
-            .map_err(|e| format!("open init lock: {e}"))?;
-        match init_lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err("archive initialization already in progress".to_string());
-            }
-            Err(TryLockError::Error(err)) => return Err(format!("lock init: {err}")),
-        }
+        let _publication_lock = lock_archive_publication(&cli.archive_dir)?;
         let keys_path = cli.archive_dir.join("keys").join("keys.env");
         let manifest_path = cli.archive_dir.join("manifests").join("manifest.tsv");
         for path in [&keys_path, &manifest_path] {

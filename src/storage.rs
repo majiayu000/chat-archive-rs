@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,25 @@ pub fn ensure_layout(root: &Path) -> AppResult<()> {
         fs::create_dir_all(root.join(rel)).map_err(|e| format!("create dir {rel}: {e}"))?;
     }
     Ok(())
+}
+
+pub fn lock_archive_publication(root: &Path) -> AppResult<File> {
+    fs::create_dir_all(root.join("state")).map_err(|e| format!("create state dir: {e}"))?;
+    // Keep this file in place: deleting a locked file would let another writer
+    // lock a different inode. Closing the handle also releases it after a kill.
+    let lock = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("state/init.lock"))
+        .map_err(|e| format!("open init lock: {e}"))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => {
+            Err("archive initialization already in progress".to_string())
+        }
+        Err(TryLockError::Error(err)) => Err(format!("lock init: {err}")),
+    }
 }
 
 pub fn default_db_path(root: &Path) -> PathBuf {
@@ -584,6 +603,9 @@ pub fn load_env_file(path: &Path) -> AppResult<HashMap<String, String>> {
 
 pub fn sync_to_remote(root: &Path, remote: &Path, chunk_file: Option<&Path>) -> AppResult<()> {
     fs::create_dir_all(remote).map_err(|e| format!("mkdir remote: {e}"))?;
+    // Own the destination before copying any payload or either marker, using
+    // the same process-held lock init takes before state/recovery-file effects.
+    let _publication_lock = lock_archive_publication(remote)?;
 
     let chunk_dir = remote.join("chunks");
     fs::create_dir_all(&chunk_dir).map_err(|e| format!("mkdir remote/chunks: {e}"))?;
@@ -664,6 +686,43 @@ mod tests {
         assert!(store.has_seen_id("xyz789")?);
         assert!(!store.has_seen_id("missing")?);
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_refuses_locked_destination_without_copying() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-init-ownership")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        ensure_layout(&archive)?;
+        ensure_layout(&remote)?;
+        let files = ["chunks/test.enc", "manifests/manifest.tsv", "keys/keys.env"];
+        for file in files {
+            fs::write(archive.join(file), b"incoming archive")?;
+            fs::write(remote.join(file), b"destination archive")?;
+        }
+        let publication_lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(remote.join("state/init.lock"))?;
+        publication_lock.lock()?;
+
+        let result = sync_to_remote(&archive, &remote, None);
+        assert!(
+            result
+                .expect_err("remote sync bypassed init ownership")
+                .contains("archive initialization already in progress")
+        );
+        for file in files {
+            assert_eq!(fs::read(remote.join(file))?, b"destination archive");
+        }
+        drop(publication_lock);
+        sync_to_remote(&archive, &remote, None)?;
+        for file in files {
+            assert_eq!(fs::read(remote.join(file))?, b"incoming archive");
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }

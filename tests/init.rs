@@ -8,6 +8,42 @@ use std::time::{Duration, Instant};
 mod common;
 use common::{create_test_workspace, path_arg, run_cli, run_cli_err};
 
+#[cfg(unix)]
+fn prepare_remote_sync_source(root: &Path, bin: &Path) -> Result<(), Box<dyn Error>> {
+    let home = root.join("source-home");
+    let archive = root.join("source-archive");
+    fs::create_dir_all(home.join(".codex"))?;
+    fs::write(
+        home.join(".codex/history.jsonl"),
+        "{\"type\":\"message\",\"text\":\"remote source fixture\"}\n",
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "source-test-passphrase",
+            "--recovery-code",
+            "source-test-recovery-code",
+        ],
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "backup",
+            "--passphrase",
+            "source-test-passphrase",
+        ],
+    )?;
+    Ok(())
+}
+
 fn assert_init_retry(
     bin: &Path,
     home: &Path,
@@ -171,6 +207,7 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
             .success()
     );
     let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    prepare_remote_sync_source(&root, bin)?;
     let mut child = Command::new(bin)
         .args([
             "--archive-dir",
@@ -226,9 +263,29 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
     } else {
         None
     };
+    let remote_sync = if ready {
+        Some(run_cli_err(
+            bin,
+            &root.join("source-home"),
+            &[
+                "--archive-dir",
+                path_arg(&root.join("source-archive"))?,
+                "backup",
+                "--passphrase",
+                "source-test-passphrase",
+                "--remote-dir",
+                path_arg(&archive)?,
+            ],
+        ))
+    } else {
+        None
+    };
     child.kill()?;
     assert!(!child.wait()?.success());
     assert!(ready, "init did not reach database initialization");
+    let remote_sync = remote_sync.expect("ready init was checked against remote sync")?;
+    assert!(String::from_utf8_lossy(&remote_sync.stderr).contains("already in progress"));
+    assert_eq!(fs::read_dir(archive.join("chunks"))?.count(), 0);
     assert!(!archive.join("keys/keys.env").exists());
     assert!(!archive.join("manifests/manifest.tsv").exists());
     let concurrent = concurrent.expect("ready child was checked for concurrent init")?;
@@ -264,6 +321,160 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
         ],
     )?;
     assert_eq!(fs::read(recovery_file)?, b"test-recovery-code\n");
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_sync_ownership_prevents_init_marker_state_and_recovery_changes()
+-> Result<(), Box<dyn Error>> {
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = create_test_workspace("sync-before-init")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    prepare_remote_sync_source(&root, bin)?;
+    fs::create_dir_all(archive.join("chunks"))?;
+    fs::create_dir_all(archive.join("state"))?;
+    let db_path = archive.join("state/state.db");
+    let db = rusqlite::Connection::open(&db_path)?;
+    db.execute_batch(
+        "CREATE TABLE state_meta (
+             archive_key TEXT, key TEXT, value TEXT, PRIMARY KEY(archive_key, key)
+         );
+         CREATE TABLE checkpoints (
+             archive_key TEXT, path TEXT, offset INTEGER, PRIMARY KEY(archive_key, path)
+         );
+         CREATE TABLE seen_ids (
+             archive_key TEXT, record_id TEXT, PRIMARY KEY(archive_key, record_id)
+         );",
+    )?;
+    let archive_key = archive.canonicalize()?.to_string_lossy().into_owned();
+    db.execute(
+        "INSERT INTO state_meta VALUES(?1, 'legacy_tsv_migrated', '1')",
+        [&archive_key],
+    )?;
+    db.execute(
+        "INSERT INTO checkpoints VALUES(?1, 'test-source', 42)",
+        [&archive_key],
+    )?;
+    db.execute("INSERT INTO seen_ids VALUES(?1, 'test-id')", [&archive_key])?;
+    let state_before = fs::read(&db_path)?;
+    let recovery_file = root.join("recovery-code");
+    fs::write(&recovery_file, b"source-test-recovery-code\n")?;
+
+    // Copying more than the FIFO buffer lets us observe real destination
+    // payload copying, then hold sync before either archive marker is copied.
+    fs::write(
+        root.join("source-archive/chunks/slow.enc"),
+        vec![0u8; 1024 * 1024],
+    )?;
+    let fifo_path = archive.join("chunks/slow.enc");
+    assert!(Command::new("mkfifo").arg(&fifo_path).status()?.success());
+    let mut fifo = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(&fifo_path)?;
+    let mut sync = Command::new(bin)
+        .args([
+            "--archive-dir",
+            path_arg(&root.join("source-archive"))?,
+            "backup",
+            "--passphrase",
+            "source-test-passphrase",
+            "--remote-dir",
+            path_arg(&archive)?,
+        ])
+        .env("HOME", root.join("source-home"))
+        .env_remove("APP_DB_PATH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let ready = loop {
+        let mut byte = [0u8; 1];
+        match fifo.read(&mut byte) {
+            Ok(1) => break true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(err.into()),
+        }
+        if sync.try_wait()?.is_some() || Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if !ready {
+        let _ = sync.kill();
+        let _ = sync.wait();
+        return Err("remote sync did not reach destination payload copy".into());
+    }
+    let refused = run_cli_err(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+            "--recovery-file",
+            path_arg(&recovery_file)?,
+        ],
+    );
+    let state_after = fs::read(&db_path)?;
+    let recovery_after = fs::read(&recovery_file)?;
+    let key_published = archive.join("keys/keys.env").exists();
+    let manifest_published = archive.join("manifests/manifest.tsv").exists();
+    let mut buffer = [0u8; 65536];
+    while sync.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            sync.kill()?;
+            sync.wait()?;
+            return Err("remote sync did not finish after releasing payload copy".into());
+        }
+        match fifo.read(&mut buffer) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    assert!(sync.wait_with_output()?.status.success());
+    let refused = refused?;
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already in progress"));
+    assert_eq!(state_after, state_before);
+    assert_eq!(recovery_after, b"source-test-recovery-code\n");
+    assert!(!key_published);
+    assert!(!manifest_published);
+    assert_eq!(
+        fs::read(archive.join("keys/keys.env"))?,
+        fs::read(root.join("source-archive/keys/keys.env"))?
+    );
+    assert_eq!(
+        fs::read(archive.join("manifests/manifest.tsv"))?,
+        fs::read(root.join("source-archive/manifests/manifest.tsv"))?
+    );
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "verify",
+            "--passphrase",
+            "source-test-passphrase",
+        ],
+    )?;
+    drop(db);
+    drop(fifo);
     fs::remove_dir_all(root)?;
     Ok(())
 }

@@ -55,10 +55,14 @@ chat-archive-rs --archive-dir ~/.chat-archive-rs init \
 `manifests/manifest.tsv`. Use a new archive directory to initialize a separate archive.
 Initialization stages and syncs the key, then publishes `keys/keys.env` by atomic
 no-replace rename only after database and optional recovery-file work succeeds.
-A destination created during initialization is preserved and publication fails;
+A key destination created during initialization is preserved and publication fails;
 filesystems without atomic no-replace rename support report an error. The first backup
 with new records creates the manifest; until then, the archive is empty. Concurrent
-initialization is refused while another init holds the archive's file lock.
+initialization and remote sync share the destination archive's file lock. A competing
+`init` or `backup --remote-dir` fails before changing destination payloads or markers;
+an init that loses ownership does not reset state or write its recovery file.
+This coordinates current CLI writers; external filesystem writers and older binaries
+that bypass the lock are not covered. No atomic two-file publication is claimed.
 Termination before publication leaves no final archive marker, so you can retry;
 abandoned private temporary keys are ignored. Reported failures remove the
 temporary key, with any cleanup error reported alongside the original error.
