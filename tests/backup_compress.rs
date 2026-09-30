@@ -25,6 +25,9 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
     let archive_arg = path_arg(&archive)?;
     let restore_arg = path_arg(&restore)?;
 
+    let unavailable_temp = root.join("unavailable-temp");
+    fs::write(&unavailable_temp, b"not a directory")?;
+    let unavailable_temp_arg = path_arg(&unavailable_temp)?;
     run_cli(
         bin,
         &home,
@@ -66,7 +69,7 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
             "test-passphrase",
         ],
     )?;
-    run_cli(
+    run_cli_with_env(
         bin,
         &home,
         &[
@@ -77,6 +80,11 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
             "test-passphrase",
             "--output-dir",
             restore_arg,
+        ],
+        &[
+            ("TMPDIR", unavailable_temp_arg),
+            ("TMP", unavailable_temp_arg),
+            ("TEMP", unavailable_temp_arg),
         ],
     )?;
     let restored = fs::read_to_string(restore.join("codex-raw.jsonl"))?;

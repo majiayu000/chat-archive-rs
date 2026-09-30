@@ -29,9 +29,13 @@ impl VerifiedChunks {
         archive_dir: &Path,
         archive_key: &str,
         manifests: &[ManifestEntry],
+        output_dir: &Path,
     ) -> AppResult<Self> {
-        let path =
-            std::env::temp_dir().join(format!("chat-archive-rs-restore-{}.enc", random_hex(16)?));
+        let snapshot_dir = output_dir
+            .ancestors()
+            .find(|path| path.is_dir())
+            .unwrap_or_else(|| Path::new("."));
+        let path = snapshot_dir.join(format!(".chat-archive-rs-restore-{}.enc", random_hex(16)?));
         let mut options = OpenOptions::new();
         options.create_new(true).read(true).write(true);
         #[cfg(unix)]
@@ -120,7 +124,7 @@ fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
         .map(|s| expand_tilde(s))
         .ok_or_else(|| "restore requires --output-dir".to_string())?;
     let manifests = load_manifest_entries(&cli.archive_dir)?;
-    let chunks = VerifiedChunks::capture(&cli.archive_dir, &archive_key, &manifests)?;
+    let chunks = VerifiedChunks::capture(&cli.archive_dir, &archive_key, &manifests, &output_dir)?;
     restore_verified_chunks(chunks, &archive_key, &output_dir)
 }
 
@@ -281,8 +285,9 @@ mod tests {
             manifests.push(entry);
         }
 
-        let chunks = VerifiedChunks::capture(&archive, key, &manifests)?;
+        let chunks = VerifiedChunks::capture(&archive, key, &manifests, &output)?;
         let snapshot_path = chunks.path.clone();
+        assert_eq!(snapshot_path.parent(), Some(root.as_path()));
         assert_eq!(
             fs::read(&snapshot_path).map_err(|e| e.to_string())?,
             expected_cipher
