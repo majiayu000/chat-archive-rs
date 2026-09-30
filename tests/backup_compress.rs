@@ -338,6 +338,124 @@ fn backup_after_restart_skips_seen_records() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn backup_defers_nested_tails_until_completed_without_skipping_or_replay()
+-> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+
+    let root = create_test_workspace("backup-nested-tail")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let restore = root.join("restore");
+    let codex_dir = home.join(".codex");
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&codex_dir)?;
+    fs::create_dir_all(&claude_dir)?;
+    let codex_path = codex_dir.join("history.jsonl");
+    let claude_path = claude_dir.join("history.jsonl");
+    let prefix = "{\"first\":1}\n";
+    let codex_tail = r#"{"a":{"b":1}"#;
+    let claude_tail = "[[2]";
+    fs::write(&codex_path, format!("{prefix}{codex_tail}"))?;
+    fs::write(&claude_path, claude_tail)?;
+
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    init_archive(bin, &home, archive_arg, &[])?;
+    let backup_args = [
+        "--archive-dir",
+        archive_arg,
+        "backup",
+        "--passphrase",
+        "test-passphrase",
+    ];
+    for pass in 0..2 {
+        let backup = run_cli(bin, &home, &backup_args)?;
+        let stdout = String::from_utf8(backup.stdout)?;
+        assert!(stdout.contains("Deferred incomplete tail lines in 2 source file(s)"));
+        if pass == 0 {
+            assert!(stdout.contains("Archived new records: 1"));
+        } else {
+            assert!(stdout.contains("No new records discovered."));
+        }
+        let db = rusqlite::Connection::open(archive.join("state/state.db"))?;
+        for (path, expected) in [(&codex_path, prefix.len() as u64), (&claude_path, 0)] {
+            let offset: u64 = db.query_row(
+                "SELECT offset FROM checkpoints WHERE path = ?1",
+                [path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(offset, expected);
+        }
+        let seen: usize = db.query_row("SELECT COUNT(*) FROM seen_ids", [], |row| row.get(0))?;
+        assert_eq!(seen, 1);
+        assert_eq!(fs::read_dir(archive.join("chunks"))?.count(), 1);
+    }
+
+    for (path, suffix) in [
+        (&codex_path, b"}".as_slice()),
+        (&claude_path, b"]".as_slice()),
+    ] {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)?
+            .write_all(suffix)?;
+    }
+    let backup = run_cli(bin, &home, &backup_args)?;
+    assert!(String::from_utf8(backup.stdout)?.contains("Archived new records: 2"));
+    let db = rusqlite::Connection::open(archive.join("state/state.db"))?;
+    for path in [&codex_path, &claude_path] {
+        let offset: u64 = db.query_row(
+            "SELECT offset FROM checkpoints WHERE path = ?1",
+            [path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(offset, fs::metadata(path)?.len());
+    }
+    let seen: usize = db.query_row("SELECT COUNT(*) FROM seen_ids", [], |row| row.get(0))?;
+    assert_eq!(seen, 3);
+    drop(db);
+    let chunk_count = fs::read_dir(archive.join("chunks"))?.count();
+    let retry = run_cli(bin, &home, &backup_args)?;
+    assert!(String::from_utf8(retry.stdout)?.contains("No new records discovered."));
+    assert_eq!(fs::read_dir(archive.join("chunks"))?.count(), chunk_count);
+
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "verify",
+            "--passphrase",
+            "test-passphrase",
+        ],
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "restore",
+            "--passphrase",
+            "test-passphrase",
+            "--output-dir",
+            path_arg(&restore)?,
+        ],
+    )?;
+    assert_eq!(
+        fs::read_to_string(restore.join("codex-raw.jsonl"))?,
+        format!("{prefix}{codex_tail}}}\n")
+    );
+    assert_eq!(
+        fs::read_to_string(restore.join("claude-raw.jsonl"))?,
+        "[[2]]\n"
+    );
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn remote_sync_retry_copies_existing_archive_when_no_new_records() -> Result<(), Box<dyn Error>> {
     let root = create_test_workspace("remote-retry")?;
     let home = root.join("home");

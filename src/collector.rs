@@ -173,10 +173,15 @@ fn provider_name(agent: Agent) -> AppResult<&'static str> {
 
 fn is_likely_complete_json_line(line: &str) -> bool {
     let s = line.trim();
-    if s.is_empty() {
+    if !((s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))) {
         return false;
     }
-    (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))
+    // Only EOF errors indicate a partial write. Preserve malformed raw records,
+    // and ignore values rather than imposing numeric or nesting limits on them.
+    match serde_json::from_str::<serde::de::IgnoredAny>(s) {
+        Ok(_) => true,
+        Err(error) => !error.is_eof(),
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +260,106 @@ mod tests {
         assert_eq!(offset, fs::metadata(&path).expect("stat").len());
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn defers_nested_json_tails_and_resumes_after_completion() {
+        let dir = test_temp_dir("collector-nested-tail");
+        let path = dir.join("source.jsonl");
+        let source = SourceFile {
+            provider: "codex".into(),
+            path: path.clone(),
+        };
+        let prefix = "{\"first\":1}\n";
+        let deep_tail = format!("{}0{}", "[".repeat(256), "]".repeat(255));
+        for (tail, completion) in [
+            (r#"{"a":{"b":1}"#, "}"),
+            ("[[1]", "]"),
+            (r#"{"a":[{"b":1}"#, "]}"),
+            (r#"{"text":"escaped \" quote and }"#, "\"}"),
+            (deep_tail.as_str(), "]"),
+        ] {
+            fs::write(&path, format!("{prefix}{tail}")).expect("write partial");
+            let (records, offset, deferred) =
+                read_records_from_source(&source, 0).expect("read partial");
+            assert_eq!(records.len(), 1, "tail: {tail}");
+            assert_eq!(offset, prefix.len() as u64, "tail: {tail}");
+            assert!(deferred, "tail: {tail}");
+            let (retry, retry_offset, retry_deferred) =
+                read_records_from_source(&source, offset).expect("retry partial");
+            assert!(retry.is_empty());
+            assert_eq!(retry_offset, offset);
+            assert!(retry_deferred);
+
+            let complete = format!("{tail}{completion}");
+            fs::write(&path, format!("{prefix}{complete}")).expect("complete tail");
+            let (resumed, end, deferred) =
+                read_records_from_source(&source, offset).expect("read completed tail");
+            assert_eq!(resumed.len(), 1);
+            assert!(!deferred);
+            assert_eq!(end, (prefix.len() + complete.len()) as u64);
+            let parts: Vec<_> = resumed[0].splitn(6, '\t').collect();
+            assert_eq!(parts[3], offset.to_string());
+            assert_eq!(hex_decode_to_string(parts[5]).expect("decode"), complete);
+            let (retry, retry_offset, deferred) =
+                read_records_from_source(&source, end).expect("retry complete");
+            assert!(retry.is_empty());
+            assert_eq!(retry_offset, end);
+            assert!(!deferred);
+        }
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn preserves_complete_and_malformed_container_tails() {
+        let dir = test_temp_dir("collector-complete-tail");
+        let path = dir.join("source.jsonl");
+        let source = SourceFile {
+            provider: "claude".into(),
+            path: path.clone(),
+        };
+        for raw in [
+            r#" {"a":{"b":[1]},"text":"} ] \""} "#,
+            "[1e400]",
+            r#"{"a":}"#,
+            " {broken} ",
+            "[1,]",
+        ] {
+            fs::write(&path, raw).expect("write tail");
+            let (records, end, deferred) = read_records_from_source(&source, 0).expect("read tail");
+            assert_eq!(records.len(), 1, "tail: {raw}");
+            assert_eq!(end, raw.len() as u64);
+            assert!(!deferred);
+            let parts: Vec<_> = records[0].splitn(6, '\t').collect();
+            assert_eq!(hex_decode_to_string(parts[5]).expect("decode"), raw);
+        }
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn keeps_scalar_tails_deferred_until_newline() {
+        let dir = test_temp_dir("collector-scalar-tail");
+        let path = dir.join("source.jsonl");
+        let source = SourceFile {
+            provider: "codex".into(),
+            path: path.clone(),
+        };
+        for raw in ["1", "123", "true", "false", "null", "\"text\"", ""] {
+            fs::write(&path, raw).expect("write tail");
+            let (records, end, deferred) = read_records_from_source(&source, 0).expect("read tail");
+            assert!(records.is_empty());
+            assert_eq!(end, 0);
+            assert_eq!(deferred, !raw.is_empty());
+        }
+        fs::write(&path, "123\n").expect("terminate number");
+        let (records, end, deferred) =
+            read_records_from_source(&source, 0).expect("read terminated number");
+        assert_eq!(records.len(), 1);
+        assert_eq!(end, 4);
+        assert!(!deferred);
+        let parts: Vec<_> = records[0].splitn(6, '\t').collect();
+        assert_eq!(hex_decode_to_string(parts[5]).expect("decode"), "123");
+        fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
