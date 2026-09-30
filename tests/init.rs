@@ -2,6 +2,8 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 mod common;
 use common::{create_test_workspace, path_arg, run_cli, run_cli_err};
@@ -39,7 +41,7 @@ fn assert_init_retry(
             "test-recovery-code",
         ],
     )?;
-    assert_eq!(fs::read(archive.join("manifests/manifest.tsv"))?, b"");
+    assert!(!archive.join("manifests/manifest.tsv").exists());
     if let Some(path) = recovery_file {
         assert_eq!(fs::read(path)?, b"test-recovery-code\n");
     }
@@ -149,6 +151,119 @@ fn init_can_be_retried_after_recovery_file_failure() -> Result<(), Box<dyn Error
     assert!(String::from_utf8_lossy(&failed.stderr).contains("private file"));
     fs::remove_dir(&recovery_file)?;
     assert_init_retry(bin, &home, &archive, Some(&recovery_file))?;
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("init-process-termination")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    let recovery_file = root.join("recovery-code");
+    // A FIFO with no reader blocks the child during recovery-file creation,
+    // after key writing and database initialization have finished.
+    assert!(
+        Command::new("mkfifo")
+            .arg(&recovery_file)
+            .status()?
+            .success()
+    );
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let mut child = Command::new(bin)
+        .args([
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+            "--recovery-file",
+            path_arg(&recovery_file)?,
+        ])
+        .env("HOME", &home)
+        .env_remove("APP_DB_PATH")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let ready = loop {
+        if child.try_wait()?.is_some() || Instant::now() >= deadline {
+            break false;
+        }
+        let db_path = archive.join("state/state.db");
+        if db_path.is_file()
+            && let Ok(db) = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            && db
+                .query_row("SELECT value FROM state_meta", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .is_ok_and(|value| value == "1")
+        {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let concurrent = if ready {
+        Some(run_cli_err(
+            bin,
+            &home,
+            &[
+                "--archive-dir",
+                path_arg(&archive)?,
+                "init",
+                "--passphrase",
+                "other-test-passphrase",
+                "--recovery-code",
+                "other-test-recovery-code",
+            ],
+        ))
+    } else {
+        None
+    };
+    child.kill()?;
+    assert!(!child.wait()?.success());
+    assert!(ready, "init did not reach database initialization");
+    assert!(!archive.join("keys/keys.env").exists());
+    assert!(!archive.join("manifests/manifest.tsv").exists());
+    let concurrent = concurrent.expect("ready child was checked for concurrent init")?;
+    assert!(
+        String::from_utf8_lossy(&concurrent.stderr)
+            .contains("archive initialization already in progress")
+    );
+    fs::remove_file(&recovery_file)?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+            "--recovery-file",
+            path_arg(&recovery_file)?,
+        ],
+    )?;
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            path_arg(&archive)?,
+            "recovery-test",
+            "--recovery-code",
+            "test-recovery-code",
+        ],
+    )?;
+    assert_eq!(fs::read(recovery_file)?, b"test-recovery-code\n");
     fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -301,8 +416,41 @@ fn concurrent_init_publishes_only_one_archive_key() -> Result<(), Box<dyn Error>
             recovery_codes[winner],
         ],
     )?;
-    assert_eq!(fs::read(archive.join("manifests/manifest.tsv"))?, b"");
+    assert!(!archive.join("manifests/manifest.tsv").exists());
     assert_eq!(fs::read_dir(archive.join("keys"))?.count(), 1);
+    let verified = run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "verify",
+            "--passphrase",
+            "test-passphrase",
+        ],
+    )?;
+    assert!(String::from_utf8_lossy(&verified.stdout).contains("Verified manifests: 0"));
+    let restore = root.join("restore");
+    run_cli(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "restore",
+            "--passphrase",
+            "test-passphrase",
+            "--output-dir",
+            path_arg(&restore)?,
+        ],
+    )?;
+    for file in [
+        "canonical-records.jsonl",
+        "codex-raw.jsonl",
+        "claude-raw.jsonl",
+    ] {
+        assert_eq!(fs::read(restore.join(file))?, b"");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

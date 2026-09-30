@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Write};
 use std::time::Instant;
 
@@ -15,6 +15,21 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
     let timer = Instant::now();
 
     let result: AppResult<()> = (|| -> AppResult<()> {
+        // Keep this file in place: deleting a locked file would let another init
+        // lock a different inode. Closing the handle also releases it after a kill.
+        let init_lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cli.archive_dir.join("state/init.lock"))
+            .map_err(|e| format!("open init lock: {e}"))?;
+        match init_lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err("archive initialization already in progress".to_string());
+            }
+            Err(TryLockError::Error(err)) => return Err(format!("lock init: {err}")),
+        }
         let keys_path = cli.archive_dir.join("keys").join("keys.env");
         let manifest_path = cli.archive_dir.join("manifests").join("manifest.tsv");
         for path in [&keys_path, &manifest_path] {
@@ -40,6 +55,8 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
         let pass_wrap = openssl_wrap_b64(archive_key.as_bytes(), &passphrase)?;
         let rec_wrap = openssl_wrap_b64(archive_key.as_bytes(), &recovery_code)?;
 
+        let staged_keys_path =
+            keys_path.with_file_name(format!(".keys.env.init-{}.tmp", random_hex(16)?));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -47,11 +64,10 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        // Exclusive creation claims this init's files without requiring hard-link support.
+        // Stage beside the destination so publication is a same-filesystem rename.
         let mut keys_file = options
-            .open(&keys_path)
-            .map_err(|e| format!("create keys: {e}"))?;
-        let mut manifest_created = false;
+            .open(&staged_keys_path)
+            .map_err(|e| format!("create staged keys: {e}"))?;
         let init_result: AppResult<()> = (|| {
             let body = format!(
                 "VERSION=1\nCREATED_AT={}\nKEY_HASH={key_hash}\nPASS_WRAP_B64={pass_wrap}\nREC_WRAP_B64={rec_wrap}\n",
@@ -63,13 +79,6 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             keys_file
                 .sync_all()
                 .map_err(|e| format!("sync keys: {e}"))?;
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&manifest_path)
-                .map_err(|e| format!("create manifest: {e}"))?;
-            manifest_created = true;
-
             let mut state = StateStore::open(&cli.archive_dir)?;
             state.reset_for_init()?;
 
@@ -85,15 +94,18 @@ pub fn cmd_init(cli: &Cli) -> AppResult<()> {
             Ok(())
         })();
         drop(keys_file);
+        // The key is the only init marker. Missing manifests already represent
+        // empty archives and the first backup creates one. No final marker is
+        // visible until all other fallible initialization work has succeeded.
+        let init_result = init_result.and_then(|()| {
+            fs::rename(&staged_keys_path, &keys_path).map_err(|e| format!("publish keys: {e}"))
+        });
         if let Err(mut err) = init_result {
-            // Remove only files this invocation created; a losing concurrent init owns none.
-            for (path, created) in [(&manifest_path, manifest_created), (&keys_path, true)] {
-                if created && let Err(cleanup_err) = fs::remove_file(path) {
-                    err.push_str(&format!(
-                        "; remove failed init file {}: {cleanup_err}",
-                        path.display()
-                    ));
-                }
+            if let Err(cleanup_err) = fs::remove_file(&staged_keys_path) {
+                err.push_str(&format!(
+                    "; remove failed init file {}: {cleanup_err}",
+                    staged_keys_path.display()
+                ));
             }
             return Err(err);
         }
