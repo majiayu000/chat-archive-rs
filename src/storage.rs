@@ -954,7 +954,10 @@ mod tests {
         store.stage_pending_checkpoint_updates("recover", &[("source.jsonl".into(), 42)])?;
         store.stage_pending_manifest_entries("recover", &entries)?;
 
-        for path in [&chunk_path, &manifest_path] {
+        for (path, error_prefix) in [
+            (&chunk_path, "open pending chunk "),
+            (&manifest_path, "sync manifest "),
+        ] {
             let original_permissions = fs::metadata(path)?.permissions();
             let mut readonly = original_permissions.clone();
             readonly.set_readonly(true);
@@ -962,7 +965,11 @@ mod tests {
             let result = store.recover_pending_backups(&archive);
             fs::set_permissions(path, original_permissions)?;
             let err = result.unwrap_err();
-            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(err.starts_with(error_prefix), "{err}");
+            assert!(
+                err.contains(path.file_name().unwrap().to_str().unwrap()),
+                "{err}"
+            );
             assert!(!store.has_seen_id("must-not-skip")?);
             assert_eq!(store.checkpoint("source.jsonl")?, None);
             assert_eq!(store.pending_manifest_entries("recover")?, entries);
