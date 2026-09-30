@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::collector::{discover_sources, stream_records_from_source};
 use crate::crypto::{openssl_encrypt_chunk_with_level, sha256_bytes};
-use crate::storage::{StateStore, load_manifest_entries, sync_to_remote};
+use crate::storage::{StateStore, load_manifest_entries, sync_archive_directories, sync_to_remote};
 use crate::types::{AppResult, Cli};
 use crate::utils::{expand_tilde, json_escape, random_hex, utc_iso, utc_stamp};
 
@@ -298,6 +298,8 @@ pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
         })?;
     }
     replace_manifest_with_appended_lines(&cli.archive_dir, &manifest_lines)?;
+    // Persist promoted names before SQLite makes their records skippable.
+    sync_archive_directories(&cli.archive_dir)?;
     if env::var_os(FAIL_AFTER_MANIFEST_REPLACE_ENV).is_some() {
         return Err(format!(
             "{FAIL_AFTER_MANIFEST_REPLACE_ENV} requested failure after manifest replace"
@@ -359,7 +361,11 @@ fn stage_records_chunk(
         archive_dir
             .join("tmp")
             .join(format!("chunk-{}-{}.enc.tmp", utc_stamp(), random_hex(4)?));
-    fs::write(&temp_file, &cipher).map_err(|e| format!("write staged chunk: {e}"))?;
+    let mut file = File::create(&temp_file).map_err(|e| format!("write staged chunk: {e}"))?;
+    file.write_all(&cipher)
+        .map_err(|e| format!("write staged chunk: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("sync staged chunk {}: {e}", temp_file.display()))?;
 
     Ok(Some(PendingChunk {
         temp_file,
@@ -402,6 +408,8 @@ fn replace_manifest_with_appended_lines(archive_dir: &Path, lines: &[String]) ->
     }
     tmp.flush()
         .map_err(|e| format!("flush manifest temp: {e}"))?;
+    tmp.sync_all()
+        .map_err(|e| format!("sync manifest temp {}: {e}", tmp_path.display()))?;
     fs::rename(&tmp_path, &manifest_path).map_err(|e| {
         format!(
             "replace manifest {} -> {}: {e}",
