@@ -193,6 +193,79 @@ fn init_can_be_retried_after_recovery_file_failure() -> Result<(), Box<dyn Error
 
 #[cfg(unix)]
 #[test]
+fn publication_lock_can_be_reopened_under_umask() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = create_test_workspace("publication-lock-umask")?;
+    let home = root.join("home");
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    prepare_remote_sync_source(&root, bin)?;
+    for mask in ["0666", "0000"] {
+        let archive = root.join(format!("archive-{mask}"));
+        // Isolate lock creation from umask restrictions on directories and
+        // SQLite's files. The persistent lock must be created by the CLI.
+        for rel in ["chunks", "manifests", "state", "keys", "tmp", "remote_sync"] {
+            fs::create_dir_all(archive.join(rel))?;
+        }
+        drop(rusqlite::Connection::open(archive.join("state/state.db"))?);
+        let init_args = [
+            "--archive-dir",
+            path_arg(&archive)?,
+            "init",
+            "--passphrase",
+            "test-passphrase",
+            "--recovery-code",
+            "test-recovery-code",
+        ];
+        let output = Command::new("sh")
+            .args([
+                "-c",
+                "umask \"$1\"; shift; exec \"$@\"",
+                "lock-umask-test",
+                mask,
+            ])
+            .arg(bin)
+            .args(init_args)
+            .env("HOME", &home)
+            .env_remove("APP_DB_PATH")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lock_path = archive.join("state/init.lock");
+        let lock_metadata = fs::metadata(&lock_path)?;
+        let refused = run_cli_err(bin, &home, &init_args)?;
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("refusing to initialize"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_eq!(lock_metadata.permissions().mode() & 0o777, 0o600);
+        run_cli(
+            bin,
+            &root.join("source-home"),
+            &[
+                "--archive-dir",
+                path_arg(&root.join("source-archive"))?,
+                "backup",
+                "--passphrase",
+                "source-test-passphrase",
+                "--remote-dir",
+                path_arg(&archive)?,
+            ],
+        )?;
+        let after_sync = fs::metadata(&lock_path)?;
+        assert_eq!(after_sync.ino(), lock_metadata.ino());
+        assert_eq!(after_sync.permissions().mode() & 0o777, 0o600);
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn init_restores_owner_permissions_under_restrictive_umask() -> Result<(), Box<dyn Error>> {
     use std::os::unix::fs::PermissionsExt;
 

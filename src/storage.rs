@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -23,12 +23,32 @@ pub fn lock_archive_publication(root: &Path) -> AppResult<File> {
     fs::create_dir_all(root.join("state")).map_err(|e| format!("create state dir: {e}"))?;
     // Keep this file in place: deleting a locked file would let another writer
     // lock a different inode. Closing the handle also releases it after a kill.
-    let lock = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join("state/init.lock"))
-        .map_err(|e| format!("open init lock: {e}"))?;
+    let lock_path = root.join("state/init.lock");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = match options.open(&lock_path) {
+        Ok(lock) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Restore owner access only for this newly created inode;
+                // existing locks keep their permissions and contents.
+                lock.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("chmod init lock: {e}"))?;
+            }
+            lock
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("open init lock: {e}"))?,
+        Err(err) => return Err(format!("open init lock: {err}")),
+    };
     match lock.try_lock() {
         Ok(()) => Ok(lock),
         Err(TryLockError::WouldBlock) => {
@@ -670,6 +690,33 @@ mod tests {
     use std::error::Error;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_lock_preserves_existing_file() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = test_dir("publication-existing-lock")?;
+        ensure_layout(&root)?;
+        let lock_path = root.join("state/init.lock");
+        fs::write(&lock_path, b"existing lock contents")?;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640))?;
+        let before = fs::metadata(&lock_path)?;
+        let lock = lock_archive_publication(&root).map_err(std::io::Error::other)?;
+        assert!(
+            lock_archive_publication(&root)
+                .expect_err("held lock allowed a competing writer")
+                .contains("archive initialization already in progress")
+        );
+        drop(lock);
+        let reopened = lock_archive_publication(&root).map_err(std::io::Error::other)?;
+        assert_eq!(reopened.metadata()?.ino(), before.ino());
+        assert_eq!(reopened.metadata()?.permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read(&lock_path)?, b"existing lock contents");
+        drop(reopened);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn state_store_migrates_legacy_tsv_files() -> Result<(), Box<dyn Error>> {
