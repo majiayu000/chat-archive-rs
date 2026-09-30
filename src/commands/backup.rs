@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::collector::{discover_sources, stream_records_from_source};
 use crate::crypto::{openssl_encrypt_chunk_with_level, sha256_bytes};
-use crate::storage::{StateStore, load_manifest_entries, sync_archive_directories, sync_to_remote};
+use crate::storage::{StateStore, load_manifest_entries, sync_archive_metadata, sync_to_remote};
 use crate::types::{AppResult, Cli};
 use crate::utils::{expand_tilde, json_escape, random_hex, utc_iso, utc_stamp};
 
@@ -296,10 +296,17 @@ pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
                 chunk_file.display()
             )
         })?;
+        // Flush the promoted file's metadata with a writable Windows handle.
+        #[cfg(windows)]
+        File::options()
+            .write(true)
+            .open(chunk_file)
+            .and_then(|chunk| chunk.sync_all())
+            .map_err(|e| format!("sync promoted chunk {}: {e}", chunk_file.display()))?;
     }
     replace_manifest_with_appended_lines(&cli.archive_dir, &manifest_lines)?;
     // Persist promoted names before SQLite makes their records skippable.
-    sync_archive_directories(&cli.archive_dir)?;
+    sync_archive_metadata(&cli.archive_dir)?;
     if env::var_os(FAIL_AFTER_MANIFEST_REPLACE_ENV).is_some() {
         return Err(format!(
             "{FAIL_AFTER_MANIFEST_REPLACE_ENV} requested failure after manifest replace"

@@ -94,7 +94,11 @@ impl StateStore {
                         .nth(7)
                         .ok_or_else(|| "invalid pending manifest line field count".to_string())?;
                     let chunk_path = resolve_archive_path(root, chunk_rel)?;
-                    let mut chunk = File::open(&chunk_path)
+                    // FlushFileBuffers requires write access on Windows.
+                    let mut chunk = File::options()
+                        .read(true)
+                        .write(cfg!(windows))
+                        .open(&chunk_path)
                         .map_err(|e| format!("open pending chunk {}: {e}", chunk_path.display()))?;
                     let mut cipher = Vec::new();
                     chunk
@@ -107,11 +111,7 @@ impl StateStore {
                         .sync_all()
                         .map_err(|e| format!("sync pending chunk {}: {e}", chunk_path.display()))?;
                 }
-                let manifest_path = root.join("manifests/manifest.tsv");
-                File::open(&manifest_path)
-                    .and_then(|manifest| manifest.sync_all())
-                    .map_err(|e| format!("sync manifest {}: {e}", manifest_path.display()))?;
-                sync_archive_directories(root)?;
+                sync_archive_metadata(root)?;
                 self.commit_pending_backup_state(&op_id)?;
                 recovered += 1;
             } else {
@@ -555,7 +555,19 @@ fn manifest_line_set(root: &Path) -> AppResult<HashSet<String>> {
     Ok(lines)
 }
 
-pub fn sync_archive_directories(root: &Path) -> AppResult<()> {
+pub fn sync_archive_metadata(root: &Path) -> AppResult<()> {
+    // Windows flushes file metadata via FlushFileBuffers, using a writable
+    // handle after rename. It does not support the Unix directory-sync path.
+    // https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching
+    let manifest_path = root.join("manifests/manifest.tsv");
+    File::options()
+        .read(true)
+        .write(cfg!(windows))
+        .open(&manifest_path)
+        .and_then(|manifest| manifest.sync_all())
+        .map_err(|e| format!("sync manifest {}: {e}", manifest_path.display()))?;
+
+    #[cfg(not(windows))]
     for rel in ["chunks", "manifests"] {
         let path = root.join(rel);
         File::open(&path)
@@ -908,6 +920,52 @@ mod tests {
             tx.commit()?;
         }
         assert_eq!(fs::read(&outside)?, b"cipher");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_recovery_retains_state_when_files_cannot_be_synced() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("pending-recovery-readonly")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let chunk_rel = "chunks/readonly.enc";
+        let chunk_path = archive.join(chunk_rel);
+        let manifest_path = archive.join("manifests/manifest.tsv");
+        let entries = [(
+            chunk_rel.to_string(),
+            pending_manifest_line(chunk_rel, b"cipher"),
+        )];
+        fs::write(&chunk_path, b"cipher")?;
+        fs::write(&manifest_path, format!("{}\n", entries[0].1))?;
+        let mut store = StateStore::open(&archive)?;
+        store.begin_pending_backup("recover")?;
+        store.stage_pending_seen_id("recover", "must-not-skip")?;
+        store.stage_pending_checkpoint_updates("recover", &[("source.jsonl".into(), 42)])?;
+        store.stage_pending_manifest_entries("recover", &entries)?;
+
+        for path in [&chunk_path, &manifest_path] {
+            let original_permissions = fs::metadata(path)?.permissions();
+            let mut readonly = original_permissions.clone();
+            readonly.set_readonly(true);
+            fs::set_permissions(path, readonly)?;
+            let result = store.recover_pending_backups(&archive);
+            fs::set_permissions(path, original_permissions)?;
+            let err = result.unwrap_err();
+            assert!(err.contains(&path.display().to_string()), "{err}");
+            assert!(!store.has_seen_id("must-not-skip")?);
+            assert_eq!(store.checkpoint("source.jsonl")?, None);
+            assert_eq!(store.pending_manifest_entries("recover")?, entries);
+            drop(store);
+            store = StateStore::open(&archive)?;
+        }
+
+        assert_eq!(store.recover_pending_backups(&archive)?, 1);
+        assert!(store.has_seen_id("must-not-skip")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, Some(42));
+        assert!(store.pending_backup_op_ids()?.is_empty());
+        drop(store);
         fs::remove_dir_all(root)?;
         Ok(())
     }
