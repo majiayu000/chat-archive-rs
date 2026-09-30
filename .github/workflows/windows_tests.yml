@@ -1,0 +1,25 @@
+name: Windows tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows_tests:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Test pending recovery
+        run: cargo +stable test --locked -j 2 pending_recovery_ -- --test-threads=2
+      - name: Test archive behavior
+        run: cargo +stable test --locked -j 2 -- --test-threads=2
