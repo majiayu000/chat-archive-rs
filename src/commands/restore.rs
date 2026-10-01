@@ -55,6 +55,19 @@ fn create_private_output(path: &std::path::Path) -> std::io::Result<File> {
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing restore output symlink: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        // Publication replaces the entry without opening it, so a symlink
+        // planted after this check still cannot redirect plaintext writes.
         let stage = path.with_file_name(format!(
             ".chat-archive-rs-restore-{}.tmp",
             crate::utils::random_hex(16).map_err(std::io::Error::other)?
