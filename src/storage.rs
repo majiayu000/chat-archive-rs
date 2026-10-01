@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -17,6 +17,45 @@ pub fn ensure_layout(root: &Path) -> AppResult<()> {
         fs::create_dir_all(root.join(rel)).map_err(|e| format!("create dir {rel}: {e}"))?;
     }
     Ok(())
+}
+
+pub fn lock_archive_publication(root: &Path) -> AppResult<File> {
+    fs::create_dir_all(root.join("state")).map_err(|e| format!("create state dir: {e}"))?;
+    // Keep this file in place: deleting a locked file would let another writer
+    // lock a different inode. Closing the handle also releases it after a kill.
+    let lock_path = root.join("state/init.lock");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = match options.open(&lock_path) {
+        Ok(lock) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Restore owner access only for this newly created inode;
+                // existing locks keep their permissions and contents.
+                lock.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("chmod init lock: {e}"))?;
+            }
+            lock
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("open init lock: {e}"))?,
+        Err(err) => return Err(format!("open init lock: {err}")),
+    };
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => {
+            Err("archive initialization already in progress".to_string())
+        }
+        Err(TryLockError::Error(err)) => Err(format!("lock init: {err}")),
+    }
 }
 
 pub fn default_db_path(root: &Path) -> PathBuf {
@@ -584,6 +623,9 @@ pub fn load_env_file(path: &Path) -> AppResult<HashMap<String, String>> {
 
 pub fn sync_to_remote(root: &Path, remote: &Path, chunk_file: Option<&Path>) -> AppResult<()> {
     fs::create_dir_all(remote).map_err(|e| format!("mkdir remote: {e}"))?;
+    // Own the destination before copying any payload or either marker, using
+    // the same process-held lock init takes before state/recovery-file effects.
+    let _publication_lock = lock_archive_publication(remote)?;
     let remote = fs::canonicalize(remote).map_err(|e| format!("canonicalize remote: {e}"))?;
 
     let chunk_dir = remote_subdir(&remote, "chunks")?;
@@ -626,6 +668,13 @@ fn copy_dir_files(src_dir: &Path, dst_dir: &Path, label: &str) -> AppResult<()> 
     {
         let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", src_dir.display()))?;
         let path = entry.path();
+        if label == "keys" {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".keys.env.init-") && name.ends_with(".tmp") {
+                continue;
+            }
+        }
         if path.is_file() {
             copy_file_to_dir(&path, dst_dir, label)?;
         }
@@ -678,6 +727,33 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    #[test]
+    fn publication_lock_preserves_existing_file() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = test_dir("publication-existing-lock")?;
+        ensure_layout(&root)?;
+        let lock_path = root.join("state/init.lock");
+        fs::write(&lock_path, b"existing lock contents")?;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640))?;
+        let before = fs::metadata(&lock_path)?;
+        let lock = lock_archive_publication(&root).map_err(std::io::Error::other)?;
+        assert!(
+            lock_archive_publication(&root)
+                .expect_err("held lock allowed a competing writer")
+                .contains("archive initialization already in progress")
+        );
+        drop(lock);
+        let reopened = lock_archive_publication(&root).map_err(std::io::Error::other)?;
+        assert_eq!(reopened.metadata()?.ino(), before.ino());
+        assert_eq!(reopened.metadata()?.permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read(&lock_path)?, b"existing lock contents");
+        drop(reopened);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn state_store_migrates_legacy_tsv_files() -> Result<(), Box<dyn Error>> {
         let root = test_dir("state-migrates-legacy")?;
@@ -700,6 +776,63 @@ mod tests {
         assert!(store.has_seen_id("xyz789")?);
         assert!(!store.has_seen_id("missing")?);
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_refuses_locked_destination_without_copying() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-init-ownership")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        ensure_layout(&archive)?;
+        ensure_layout(&remote)?;
+        let files = ["chunks/test.enc", "manifests/manifest.tsv", "keys/keys.env"];
+        for file in files {
+            fs::write(archive.join(file), b"incoming archive")?;
+            fs::write(remote.join(file), b"destination archive")?;
+        }
+        let publication_lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(remote.join("state/init.lock"))?;
+        publication_lock.lock()?;
+
+        let result = sync_to_remote(&archive, &remote, None);
+        assert!(
+            result
+                .expect_err("remote sync bypassed init ownership")
+                .contains("archive initialization already in progress")
+        );
+        for file in files {
+            assert_eq!(fs::read(remote.join(file))?, b"destination archive");
+        }
+        drop(publication_lock);
+        sync_to_remote(&archive, &remote, None)?;
+        for file in files {
+            assert_eq!(fs::read(remote.join(file))?, b"incoming archive");
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_excludes_private_init_stages() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-private-init-stages")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        ensure_layout(&archive)?;
+        fs::write(archive.join("keys/keys.env"), b"published keys")?;
+        fs::write(
+            archive.join("keys/.keys.env.init-abandoned.tmp"),
+            b"abandoned stage fixture",
+        )?;
+        fs::write(archive.join("keys/other.env"), b"other key file")?;
+        sync_to_remote(&archive, &remote, None)?;
+        assert!(!remote.join("keys/.keys.env.init-abandoned.tmp").exists());
+        assert_eq!(fs::read(remote.join("keys/keys.env"))?, b"published keys");
+        assert_eq!(fs::read(remote.join("keys/other.env"))?, b"other key file");
         fs::remove_dir_all(root)?;
         Ok(())
     }
