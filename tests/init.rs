@@ -494,8 +494,6 @@ fn init_can_be_retried_after_process_termination() -> Result<(), Box<dyn Error>>
 fn remote_sync_ownership_prevents_init_marker_state_and_recovery_changes()
 -> Result<(), Box<dyn Error>> {
     use std::fs::OpenOptions;
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let root = create_test_workspace("sync-before-init")?;
     let home = root.join("home");
@@ -531,18 +529,13 @@ fn remote_sync_ownership_prevents_init_marker_state_and_recovery_changes()
     let recovery_file = root.join("recovery-code");
     fs::write(&recovery_file, b"source-test-recovery-code\n")?;
 
-    // Copying more than the FIFO buffer lets us observe real destination
-    // payload copying, then hold sync before either archive marker is copied.
-    fs::write(
-        root.join("source-archive/chunks/slow.enc"),
-        vec![0u8; 1024 * 1024],
-    )?;
-    let fifo_path = archive.join("chunks/slow.enc");
-    assert!(Command::new("mkfifo").arg(&fifo_path).status()?.success());
-    let mut fifo = OpenOptions::new()
-        .read(true)
-        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
-        .open(&fifo_path)?;
+    // Observe an actual staged payload copy while publication ownership is held.
+    // Atomic replacement no longer opens a FIFO at the final destination.
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(root.join("source-archive/chunks/slow.enc"))?
+        .set_len(256 * 1024 * 1024)?;
     let mut sync = Command::new(bin)
         .args([
             "--archive-dir",
@@ -558,61 +551,96 @@ fn remote_sync_ownership_prevents_init_marker_state_and_recovery_changes()
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let ready = loop {
-        let mut byte = [0u8; 1];
-        match fifo.read(&mut byte) {
-            Ok(1) => break true,
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err.into()),
-        }
-        if sync.try_wait()?.is_some() || Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    if !ready {
-        let _ = sync.kill();
-        let _ = sync.wait();
-        return Err("remote sync did not reach destination payload copy".into());
-    }
-    let refused = run_cli_err(
-        bin,
-        &home,
-        &[
-            "--archive-dir",
-            path_arg(&archive)?,
-            "init",
-            "--passphrase",
-            "test-passphrase",
-            "--recovery-code",
-            "test-recovery-code",
-            "--recovery-file",
-            path_arg(&recovery_file)?,
-        ],
-    );
-    let state_after = fs::read(&db_path)?;
-    let recovery_after = fs::read(&recovery_file)?;
-    let key_published = archive.join("keys/keys.env").exists();
-    let manifest_published = archive.join("manifests/manifest.tsv").exists();
-    let mut buffer = [0u8; 65536];
-    while sync.try_wait()?.is_none() {
-        if Instant::now() >= deadline {
-            sync.kill()?;
-            sync.wait()?;
-            return Err("remote sync did not finish after releasing payload copy".into());
-        }
-        match fifo.read(&mut buffer) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+    let observed = (|| -> Result<_, Box<dyn Error>> {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        let ready = loop {
+            let mut copying = false;
+            for entry in fs::read_dir(archive.join("chunks"))? {
+                let entry = entry?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chat-archive-rs-sync-")
+                {
+                    match entry.metadata() {
+                        Ok(metadata) => copying |= metadata.len() > 0,
+                        // A completed copy may be renamed between listing and stat.
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
             }
-            Err(err) => return Err(err.into()),
+            if copying {
+                if !Command::new("kill")
+                    .args(["-STOP", &sync.id().to_string()])
+                    .status()?
+                    .success()
+                {
+                    return Err("could not pause remote sync payload copy".into());
+                }
+                break true;
+            }
+            if sync.try_wait()?.is_some() || Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        if !ready {
+            return Err("remote sync did not reach staged payload copy".into());
         }
+        let refused = run_cli_err(
+            bin,
+            &home,
+            &[
+                "--archive-dir",
+                path_arg(&archive)?,
+                "init",
+                "--passphrase",
+                "test-passphrase",
+                "--recovery-code",
+                "test-recovery-code",
+                "--recovery-file",
+                path_arg(&recovery_file)?,
+            ],
+        )?;
+        let state_after = fs::read(&db_path)?;
+        let recovery_after = fs::read(&recovery_file)?;
+        let key_published = archive.join("keys/keys.env").exists();
+        let manifest_published = archive.join("manifests/manifest.tsv").exists();
+        if !Command::new("kill")
+            .args(["-CONT", &sync.id().to_string()])
+            .status()?
+            .success()
+        {
+            return Err("could not resume remote sync payload copy".into());
+        }
+        let status = loop {
+            if let Some(status) = sync.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err("remote sync did not finish after releasing payload copy".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Ok((
+            status,
+            refused,
+            state_after,
+            recovery_after,
+            key_published,
+            manifest_published,
+        ))
+    })();
+    // Reap the actual child before propagating observation errors or asserting.
+    // SIGKILL also terminates a child still paused by SIGSTOP.
+    if sync.try_wait()?.is_none() {
+        sync.kill()?;
     }
-    assert!(sync.wait_with_output()?.status.success());
-    let refused = refused?;
+    sync.wait()?;
+    let (status, refused, state_after, recovery_after, key_published, manifest_published) =
+        observed?;
+    assert!(status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("already in progress"));
     assert_eq!(state_after, state_before);
     assert_eq!(recovery_after, b"source-test-recovery-code\n");
@@ -638,7 +666,6 @@ fn remote_sync_ownership_prevents_init_marker_state_and_recovery_changes()
         ],
     )?;
     drop(db);
-    drop(fifo);
     fs::remove_dir_all(root)?;
     Ok(())
 }
