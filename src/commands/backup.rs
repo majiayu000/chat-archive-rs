@@ -178,6 +178,20 @@ pub fn cmd_backup(cli: &Cli) -> AppResult<()> {
 }
 
 pub(super) fn run_backup_once(cli: &Cli) -> AppResult<BackupStats> {
+    let lock_path = cli.archive_dir.join("state/backup.lock");
+    // Keep this handle alive through recovery, state commits and remote sync.
+    // Leave the lock file in place so every process locks the same file.
+    let _backup_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("open backup lock {}: {e}", lock_path.display()))?;
+    _backup_lock
+        .lock()
+        .map_err(|e| format!("lock backup {}: {e}", lock_path.display()))?;
+
     let archive_key = unlock_archive_key(cli)?;
     let compress_level = parse_compress_level(cli.options.get("--compress-level"))?;
     let chunk_plain_limit = parse_chunk_plain_byte_limit()?;
