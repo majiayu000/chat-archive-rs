@@ -23,3 +23,5 @@ jobs:
         run: cargo +stable test --locked -j 2 pending_recovery_ -- --test-threads=2
       - name: Test backup behavior
         run: cargo +stable test --locked -j 2 --test backup_compress -- --test-threads=2
+      - name: Test monitor behavior
+        run: cargo +stable test --locked -j 2 --test monitor_config --test monitor_status -- --test-threads=2
