@@ -116,6 +116,51 @@ pub fn cmd_restore(cli: &Cli) -> AppResult<()> {
     }
 }
 
+fn create_private_output(path: &std::path::Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other(format!(
+                    "refusing restore output symlink: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        // Publication replaces the entry without opening it, so a symlink
+        // planted after this check still cannot redirect plaintext writes.
+        let stage = path.with_file_name(format!(
+            ".chat-archive-rs-restore-{}.tmp",
+            crate::utils::random_hex(16).map_err(std::io::Error::other)?
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        options.mode(0o600);
+        let file = options.open(&stage)?;
+        // A fresh inode keeps previously opened outputs from seeing new plaintext.
+        let result = file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .and_then(|()| fs::rename(&stage, path));
+        if let Err(err) = result {
+            fs::remove_file(&stage).map_err(|cleanup| {
+                std::io::Error::other(format!("{err}; remove restore output stage: {cleanup}"))
+            })?;
+            return Err(err);
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        File::create(path)
+    }
+}
+
 fn run_restore_once(cli: &Cli) -> AppResult<RestoreStats> {
     let archive_key = unlock_archive_key(cli)?;
     let output_dir = cli
@@ -137,9 +182,11 @@ fn restore_verified_chunks(
     let canonical = output_dir.join("canonical-records.jsonl");
     let codex_raw = output_dir.join("codex-raw.jsonl");
     let claude_raw = output_dir.join("claude-raw.jsonl");
-    let canonical_file = File::create(&canonical).map_err(|e| format!("reset canonical: {e}"))?;
-    let codex_file = File::create(&codex_raw).map_err(|e| format!("reset codex: {e}"))?;
-    let claude_file = File::create(&claude_raw).map_err(|e| format!("reset claude: {e}"))?;
+    let canonical_file =
+        create_private_output(&canonical).map_err(|e| format!("reset canonical: {e}"))?;
+    let codex_file = create_private_output(&codex_raw).map_err(|e| format!("reset codex: {e}"))?;
+    let claude_file =
+        create_private_output(&claude_raw).map_err(|e| format!("reset claude: {e}"))?;
     let mut canonical_writer = BufWriter::with_capacity(8 * 1024 * 1024, canonical_file);
     let mut codex_writer = BufWriter::with_capacity(4 * 1024 * 1024, codex_file);
     let mut claude_writer = BufWriter::with_capacity(4 * 1024 * 1024, claude_file);
@@ -216,7 +263,8 @@ fn restore_verified_chunks(
         json_escape(&codex_raw.to_string_lossy()),
         json_escape(&claude_raw.to_string_lossy())
     );
-    fs::write(output_dir.join("restore-report.json"), report)
+    create_private_output(&output_dir.join("restore-report.json"))
+        .and_then(|mut file| file.write_all(report.as_bytes()))
         .map_err(|e| format!("write restore report: {e}"))?;
 
     Ok(RestoreStats {

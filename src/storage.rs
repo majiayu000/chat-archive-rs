@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions, TryLockError};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::crypto::sha256_bytes;
 use crate::types::{AppResult, ManifestEntry};
-use crate::utils::resolve_archive_path;
+use crate::utils::{random_hex, resolve_archive_path};
 
 const LEGACY_TSV_MIGRATION_KEY: &str = "legacy_tsv_migrated";
 const DEFAULT_DB_FILE: &str = concat!("state", ".db");
@@ -17,6 +18,45 @@ pub fn ensure_layout(root: &Path) -> AppResult<()> {
         fs::create_dir_all(root.join(rel)).map_err(|e| format!("create dir {rel}: {e}"))?;
     }
     Ok(())
+}
+
+pub fn lock_archive_publication(root: &Path) -> AppResult<File> {
+    fs::create_dir_all(root.join("state")).map_err(|e| format!("create state dir: {e}"))?;
+    // Keep this file in place: deleting a locked file would let another writer
+    // lock a different inode. Closing the handle also releases it after a kill.
+    let lock_path = root.join("state/init.lock");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = match options.open(&lock_path) {
+        Ok(lock) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Restore owner access only for this newly created inode;
+                // existing locks keep their permissions and contents.
+                lock.set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("chmod init lock: {e}"))?;
+            }
+            lock
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("open init lock: {e}"))?,
+        Err(err) => return Err(format!("open init lock: {err}")),
+    };
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => {
+            Err("archive initialization already in progress".to_string())
+        }
+        Err(TryLockError::Error(err)) => Err(format!("lock init: {err}")),
+    }
 }
 
 pub fn default_db_path(root: &Path) -> PathBuf {
@@ -87,6 +127,30 @@ impl StateStore {
             }
 
             if manifest_contains_pending_lines(root, &manifest_entries)? {
+                for (chunk_rel, manifest_line) in &manifest_entries {
+                    let cipher_sha = manifest_line
+                        .splitn(8, '\t')
+                        .nth(7)
+                        .ok_or_else(|| "invalid pending manifest line field count".to_string())?;
+                    let chunk_path = resolve_archive_path(root, chunk_rel)?;
+                    // FlushFileBuffers requires write access on Windows.
+                    let mut chunk = File::options()
+                        .read(true)
+                        .write(cfg!(windows))
+                        .open(&chunk_path)
+                        .map_err(|e| format!("open pending chunk {}: {e}", chunk_path.display()))?;
+                    let mut cipher = Vec::new();
+                    chunk
+                        .read_to_end(&mut cipher)
+                        .map_err(|e| format!("read pending chunk {}: {e}", chunk_path.display()))?;
+                    if sha256_bytes(&cipher)? != cipher_sha {
+                        return Err(format!("Cipher hash mismatch: {}", chunk_path.display()));
+                    }
+                    chunk
+                        .sync_all()
+                        .map_err(|e| format!("sync pending chunk {}: {e}", chunk_path.display()))?;
+                }
+                sync_archive_metadata(root)?;
                 self.commit_pending_backup_state(&op_id)?;
                 recovered += 1;
             } else {
@@ -530,6 +594,28 @@ fn manifest_line_set(root: &Path) -> AppResult<HashSet<String>> {
     Ok(lines)
 }
 
+pub fn sync_archive_metadata(root: &Path) -> AppResult<()> {
+    // Windows flushes file metadata via FlushFileBuffers, using a writable
+    // handle after rename. It does not support the Unix directory-sync path.
+    // https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching
+    let manifest_path = root.join("manifests/manifest.tsv");
+    File::options()
+        .read(true)
+        .write(cfg!(windows))
+        .open(&manifest_path)
+        .and_then(|manifest| manifest.sync_all())
+        .map_err(|e| format!("sync manifest {}: {e}", manifest_path.display()))?;
+
+    #[cfg(not(windows))]
+    for rel in ["chunks", "manifests"] {
+        let path = root.join(rel);
+        File::open(&path)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("sync archive directory {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn load_manifest_entries(root: &Path) -> AppResult<Vec<ManifestEntry>> {
     let path = root.join("manifests").join("manifest.tsv");
     if !path.exists() {
@@ -584,9 +670,12 @@ pub fn load_env_file(path: &Path) -> AppResult<HashMap<String, String>> {
 
 pub fn sync_to_remote(root: &Path, remote: &Path, chunk_file: Option<&Path>) -> AppResult<()> {
     fs::create_dir_all(remote).map_err(|e| format!("mkdir remote: {e}"))?;
+    // Own the destination before copying any payload or either marker, using
+    // the same process-held lock init takes before state/recovery-file effects.
+    let _publication_lock = lock_archive_publication(remote)?;
+    let remote = fs::canonicalize(remote).map_err(|e| format!("canonicalize remote: {e}"))?;
 
-    let chunk_dir = remote.join("chunks");
-    fs::create_dir_all(&chunk_dir).map_err(|e| format!("mkdir remote/chunks: {e}"))?;
+    let chunk_dir = remote_subdir(&remote, "chunks")?;
     copy_dir_files(&root.join("chunks"), &chunk_dir, "chunks")?;
     if let Some(chunk) = chunk_file
         && !chunk.starts_with(root.join("chunks"))
@@ -596,16 +685,25 @@ pub fn sync_to_remote(root: &Path, remote: &Path, chunk_file: Option<&Path>) -> 
 
     for rel in ["manifests", "keys"] {
         let src_dir = root.join(rel);
-        let dst_dir = remote.join(rel);
-        fs::create_dir_all(&dst_dir).map_err(|e| format!("mkdir remote/{rel}: {e}"))?;
+        let dst_dir = remote_subdir(&remote, rel)?;
         copy_dir_files(&src_dir, &dst_dir, rel)?;
     }
     let config_src = root.join("config.json");
     if config_src.exists() {
-        fs::copy(&config_src, remote.join("config.json"))
+        copy_file_to_dir(&config_src, &remote, "config")
             .map_err(|e| format!("copy config: {e}"))?;
     }
     Ok(())
+}
+
+fn remote_subdir(remote: &Path, rel: &str) -> AppResult<PathBuf> {
+    let dir = remote.join(rel);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir remote/{rel}: {e}"))?;
+    let dir = fs::canonicalize(&dir).map_err(|e| format!("canonicalize remote/{rel}: {e}"))?;
+    if !dir.starts_with(remote) || dir == remote {
+        return Err(format!("remote/{rel} escapes remote root"));
+    }
+    Ok(dir)
 }
 
 fn copy_dir_files(src_dir: &Path, dst_dir: &Path, label: &str) -> AppResult<()> {
@@ -617,6 +715,13 @@ fn copy_dir_files(src_dir: &Path, dst_dir: &Path, label: &str) -> AppResult<()> 
     {
         let entry = entry.map_err(|e| format!("read_dir entry {}: {e}", src_dir.display()))?;
         let path = entry.path();
+        if label == "keys" {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".keys.env.init-") && name.ends_with(".tmp") {
+                continue;
+            }
+        }
         if path.is_file() {
             copy_file_to_dir(&path, dst_dir, label)?;
         }
@@ -629,8 +734,35 @@ fn copy_file_to_dir(path: &Path, dst_dir: &Path, label: &str) -> AppResult<()> {
         path.file_name()
             .ok_or_else(|| format!("invalid {label} filename {}", path.display()))?,
     );
-    fs::copy(path, &target)
-        .map_err(|e| format!("copy {} -> {}: {e}", path.display(), target.display()))?;
+    let copy_error = |e| format!("copy {} -> {}: {e}", path.display(), target.display());
+    let mut source = File::open(path).map_err(copy_error)?;
+    let permissions = source.metadata().map_err(copy_error)?.permissions();
+    let stage = dst_dir.join(format!(".chat-archive-rs-sync-{}.tmp", random_hex(16)?));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut destination = options.open(&stage).map_err(copy_error)?;
+    let result = (|| {
+        std::io::copy(&mut source, &mut destination)?;
+        destination.set_permissions(permissions)
+    })();
+    drop(destination);
+    // Rename replaces the destination entry itself, including a dangling symlink.
+    let result = result.and_then(|()| fs::rename(&stage, &target));
+    if let Err(err) = result {
+        let err = copy_error(err);
+        return match fs::remove_file(&stage) {
+            Ok(()) => Err(err),
+            Err(cleanup) => Err(format!(
+                "{err}; remove remote stage {}: {cleanup}",
+                stage.display()
+            )),
+        };
+    }
     Ok(())
 }
 
@@ -641,6 +773,33 @@ mod tests {
     use std::error::Error;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_lock_preserves_existing_file() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = test_dir("publication-existing-lock")?;
+        ensure_layout(&root)?;
+        let lock_path = root.join("state/init.lock");
+        fs::write(&lock_path, b"existing lock contents")?;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640))?;
+        let before = fs::metadata(&lock_path)?;
+        let lock = lock_archive_publication(&root).map_err(std::io::Error::other)?;
+        assert!(
+            lock_archive_publication(&root)
+                .expect_err("held lock allowed a competing writer")
+                .contains("archive initialization already in progress")
+        );
+        drop(lock);
+        let reopened = lock_archive_publication(&root).map_err(std::io::Error::other)?;
+        assert_eq!(reopened.metadata()?.ino(), before.ino());
+        assert_eq!(reopened.metadata()?.permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read(&lock_path)?, b"existing lock contents");
+        drop(reopened);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn state_store_migrates_legacy_tsv_files() -> Result<(), Box<dyn Error>> {
@@ -664,6 +823,63 @@ mod tests {
         assert!(store.has_seen_id("xyz789")?);
         assert!(!store.has_seen_id("missing")?);
 
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_refuses_locked_destination_without_copying() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-init-ownership")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        ensure_layout(&archive)?;
+        ensure_layout(&remote)?;
+        let files = ["chunks/test.enc", "manifests/manifest.tsv", "keys/keys.env"];
+        for file in files {
+            fs::write(archive.join(file), b"incoming archive")?;
+            fs::write(remote.join(file), b"destination archive")?;
+        }
+        let publication_lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(remote.join("state/init.lock"))?;
+        publication_lock.lock()?;
+
+        let result = sync_to_remote(&archive, &remote, None);
+        assert!(
+            result
+                .expect_err("remote sync bypassed init ownership")
+                .contains("archive initialization already in progress")
+        );
+        for file in files {
+            assert_eq!(fs::read(remote.join(file))?, b"destination archive");
+        }
+        drop(publication_lock);
+        sync_to_remote(&archive, &remote, None)?;
+        for file in files {
+            assert_eq!(fs::read(remote.join(file))?, b"incoming archive");
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_excludes_private_init_stages() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-private-init-stages")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        ensure_layout(&archive)?;
+        fs::write(archive.join("keys/keys.env"), b"published keys")?;
+        fs::write(
+            archive.join("keys/.keys.env.init-abandoned.tmp"),
+            b"abandoned stage fixture",
+        )?;
+        fs::write(archive.join("keys/other.env"), b"other key file")?;
+        sync_to_remote(&archive, &remote, None)?;
+        assert!(!remote.join("keys/.keys.env.init-abandoned.tmp").exists());
+        assert_eq!(fs::read(remote.join("keys/keys.env"))?, b"published keys");
+        assert_eq!(fs::read(remote.join("keys/other.env"))?, b"other key file");
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -698,6 +914,146 @@ mod tests {
             fs::read(remote.join("manifests").join("manifest.tsv"))?,
             b"manifest"
         );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_to_remote_replaces_destination_symlinks() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = test_dir("sync-file-symlinks")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside)?;
+        for rel in [
+            "chunks/old.enc",
+            "manifests/manifest.tsv",
+            "keys/keys.env",
+            "config.json",
+        ] {
+            let source = archive.join(rel);
+            let destination = remote.join(rel);
+            fs::create_dir_all(source.parent().unwrap())?;
+            fs::create_dir_all(destination.parent().unwrap())?;
+            fs::write(&source, rel.as_bytes())?;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o600))?;
+            let sentinel = outside.join(source.file_name().unwrap());
+            fs::write(&sentinel, b"outside sentinel")?;
+            symlink(&sentinel, &destination)?;
+        }
+        let extra_chunk = root.join("extra.enc");
+        fs::write(&extra_chunk, b"extra chunk")?;
+        symlink(outside.join("missing.enc"), remote.join("chunks/extra.enc"))?;
+
+        sync_to_remote(&archive, &remote, Some(&extra_chunk))?;
+
+        for rel in [
+            "chunks/old.enc",
+            "manifests/manifest.tsv",
+            "keys/keys.env",
+            "config.json",
+        ] {
+            let destination = remote.join(rel);
+            assert_eq!(
+                fs::read(outside.join(destination.file_name().unwrap()))?,
+                b"outside sentinel",
+                "{rel}"
+            );
+            assert!(
+                !fs::symlink_metadata(&destination)?.file_type().is_symlink(),
+                "{rel}"
+            );
+            assert_eq!(fs::read(&destination)?, rel.as_bytes());
+            assert_eq!(
+                fs::metadata(&destination)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!outside.join("missing.enc").exists());
+        assert_eq!(fs::read(remote.join("chunks/extra.enc"))?, b"extra chunk");
+        assert!(
+            !fs::symlink_metadata(remote.join("chunks/extra.enc"))?
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sync_to_remote_rejects_directory_symlink_escapes() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-dir-symlinks")?;
+        let archive = root.join("archive");
+        for rel in ["chunks", "manifests", "keys"] {
+            fs::create_dir_all(archive.join(rel))?;
+            fs::write(archive.join(rel).join("sentinel"), b"archive bytes")?;
+        }
+        for rel in ["chunks", "manifests", "keys"] {
+            let remote = root.join(format!("remote-{rel}"));
+            let outside = root.join(format!("outside-{rel}"));
+            fs::create_dir_all(&remote)?;
+            fs::create_dir_all(&outside)?;
+            fs::write(outside.join("sentinel"), b"outside sentinel")?;
+            std::os::unix::fs::symlink(&outside, remote.join(rel))?;
+            let result = sync_to_remote(&archive, &remote, None);
+            assert_eq!(
+                fs::read(outside.join("sentinel"))?,
+                b"outside sentinel",
+                "{rel}"
+            );
+            let err = result.expect_err("escaped destination must fail");
+            assert!(err.contains("escapes remote root"), "{err}");
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sync_to_remote_copy_error_preserves_destination() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("sync-copy-error")?;
+        let archive = root.join("archive");
+        let remote = root.join("remote");
+        fs::create_dir_all(archive.join("keys"))?;
+        fs::write(archive.join("keys/keys.env"), b"dummy key bytes")?;
+        fs::create_dir_all(remote.join("keys/keys.env"))?;
+        fs::write(remote.join("keys/keys.env/sentinel"), b"keep")?;
+
+        let err = sync_to_remote(&archive, &remote, None).unwrap_err();
+        assert!(err.starts_with("copy "), "{err}");
+        assert!(err.contains("keys.env"), "{err}");
+        assert_eq!(fs::read(remote.join("keys/keys.env/sentinel"))?, b"keep");
+        assert_eq!(fs::read_dir(remote.join("keys"))?.count(), 1);
+
+        fs::remove_dir_all(remote.join("keys/keys.env"))?;
+        fs::write(archive.join("config.json"), b"dummy config")?;
+        fs::create_dir(remote.join("config.json"))?;
+        fs::write(remote.join("config.json/sentinel"), b"keep config")?;
+        let err = sync_to_remote(&archive, &remote, None).unwrap_err();
+        assert!(err.starts_with("copy config:"), "{err}");
+        assert_eq!(
+            fs::read(remote.join("config.json/sentinel"))?,
+            b"keep config"
+        );
+        for entry in fs::read_dir(&remote)? {
+            assert!(
+                !entry?
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".chat-archive-rs-sync-"),
+                "failed config publication left a temporary copy"
+            );
+        }
+
+        let missing_chunk = root.join("missing.enc");
+        let err = sync_to_remote(&archive, &remote, Some(&missing_chunk)).unwrap_err();
+        assert!(err.starts_with("copy "), "{err}");
+        assert!(err.contains("missing.enc"), "{err}");
+        assert_eq!(fs::read_dir(remote.join("chunks"))?.count(), 0);
 
         fs::remove_dir_all(root)?;
         Ok(())
@@ -780,6 +1136,171 @@ mod tests {
                 &[(chunk_rel.into(), format!("pending-{op_id}"))],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn pending_recovery_requires_all_chunks_before_committing_state() -> Result<(), Box<dyn Error>>
+    {
+        let root = test_dir("pending-recovery-chunks")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let entries = [
+            (
+                "chunks/first.enc".to_string(),
+                pending_manifest_line("chunks/first.enc", b"first cipher"),
+            ),
+            (
+                "chunks/second.enc".to_string(),
+                pending_manifest_line("chunks/second.enc", b"second cipher"),
+            ),
+        ];
+        fs::write(archive.join("chunks/first.enc"), b"first cipher")?;
+        fs::write(
+            archive.join("manifests/manifest.tsv"),
+            format!("{}\n{}\n", entries[0].1, entries[1].1),
+        )?;
+        let mut store = StateStore::open(&archive)?;
+        store.begin_pending_backup("recover")?;
+        store.stage_pending_seen_id("recover", "first-id")?;
+        store.stage_pending_seen_id("recover", "second-id")?;
+        store.stage_pending_checkpoint_updates("recover", &[("source.jsonl".into(), 42)])?;
+        store.stage_pending_manifest_entries("recover", &entries)?;
+
+        let err = store.recover_pending_backups(&archive).unwrap_err();
+        assert!(err.contains("second.enc"), "{err}");
+        assert!(!store.has_seen_id("first-id")?);
+        assert!(!store.has_seen_id("second-id")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, None);
+        assert_eq!(store.pending_manifest_entries("recover")?, entries);
+        drop(store);
+
+        let mut store = StateStore::open(&archive)?;
+        fs::write(archive.join("chunks/second.enc"), b"corrupt cipher")?;
+        let err = store.recover_pending_backups(&archive).unwrap_err();
+        assert!(err.contains("Cipher hash mismatch"), "{err}");
+        assert!(!store.has_seen_id("first-id")?);
+        assert!(!store.has_seen_id("second-id")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, None);
+        assert_eq!(store.pending_manifest_entries("recover")?, entries);
+
+        fs::write(archive.join("chunks/second.enc"), b"second cipher")?;
+        assert_eq!(store.recover_pending_backups(&archive)?, 1);
+        assert!(store.has_seen_id("first-id")?);
+        assert!(store.has_seen_id("second-id")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, Some(42));
+        assert!(store.pending_backup_op_ids()?.is_empty());
+        drop(store);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pending_recovery_rejects_chunks_outside_archive() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("pending-recovery-paths")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let outside = root.join("outside.enc");
+        fs::write(&outside, b"cipher")?;
+        let mut paths = vec![
+            "../outside.enc".to_string(),
+            outside.to_str().unwrap().into(),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, archive.join("chunks/linked.enc"))?;
+            paths.push("chunks/linked.enc".into());
+        }
+
+        let mut store = StateStore::open(&archive)?;
+        for (idx, chunk_rel) in paths.iter().enumerate() {
+            let op_id = format!("escape-{idx}");
+            let line = pending_manifest_line(chunk_rel, b"cipher");
+            fs::write(archive.join("manifests/manifest.tsv"), format!("{line}\n"))?;
+            store.begin_pending_backup(&op_id)?;
+            store.stage_pending_seen_id(&op_id, "must-not-skip")?;
+            store.stage_pending_checkpoint_updates(&op_id, &[("source.jsonl".into(), 42)])?;
+            store.stage_pending_manifest_entries(&op_id, &[(chunk_rel.clone(), line)])?;
+            assert!(store.recover_pending_backups(&archive).is_err());
+            assert!(!store.has_seen_id("must-not-skip")?);
+            assert_eq!(store.checkpoint("source.jsonl")?, None);
+            assert_eq!(store.pending_manifest_entries(&op_id)?.len(), 1);
+            // Isolate each invalid path without discarding its chunk.
+            let tx = store.conn.transaction()?;
+            delete_pending_backup_rows(&tx, &store.archive_key, &op_id)?;
+            tx.commit()?;
+        }
+        assert_eq!(fs::read(&outside)?, b"cipher");
+        drop(store);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_recovery_retains_state_when_files_cannot_be_synced() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("pending-recovery-readonly")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let chunk_rel = "chunks/readonly.enc";
+        let chunk_path = archive.join("chunks").join("readonly.enc");
+        let manifest_path = archive.join("manifests/manifest.tsv");
+        let entries = [(
+            chunk_rel.to_string(),
+            pending_manifest_line(chunk_rel, b"cipher"),
+        )];
+        fs::write(&chunk_path, b"cipher")?;
+        fs::write(&manifest_path, format!("{}\n", entries[0].1))?;
+        for path in [&chunk_path, &manifest_path] {
+            // A read-only handle cannot call FlushFileBuffers on Windows,
+            // even while the file itself is writable.
+            let err = File::open(path)?.sync_all().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            File::options().write(true).open(path)?.sync_all()?;
+        }
+        let mut store = StateStore::open(&archive)?;
+        store.begin_pending_backup("recover")?;
+        store.stage_pending_seen_id("recover", "must-not-skip")?;
+        store.stage_pending_checkpoint_updates("recover", &[("source.jsonl".into(), 42)])?;
+        store.stage_pending_manifest_entries("recover", &entries)?;
+
+        for (path, error_prefix) in [
+            (&chunk_path, "open pending chunk "),
+            (&manifest_path, "sync manifest "),
+        ] {
+            let original_permissions = fs::metadata(path)?.permissions();
+            let mut readonly = original_permissions.clone();
+            readonly.set_readonly(true);
+            fs::set_permissions(path, readonly)?;
+            let result = store.recover_pending_backups(&archive);
+            fs::set_permissions(path, original_permissions)?;
+            let err = result.unwrap_err();
+            assert!(err.starts_with(error_prefix), "{err}");
+            assert!(
+                err.contains(path.file_name().unwrap().to_str().unwrap()),
+                "{err}"
+            );
+            assert!(!store.has_seen_id("must-not-skip")?);
+            assert_eq!(store.checkpoint("source.jsonl")?, None);
+            assert_eq!(store.pending_manifest_entries("recover")?, entries);
+            drop(store);
+            store = StateStore::open(&archive)?;
+        }
+
+        assert_eq!(store.recover_pending_backups(&archive)?, 1);
+        assert!(store.has_seen_id("must-not-skip")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, Some(42));
+        assert!(store.pending_backup_op_ids()?.is_empty());
+        drop(store);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn pending_manifest_line(chunk_rel: &str, cipher: &[u8]) -> String {
+        let cipher_hash = crate::crypto::sha256_bytes(cipher).unwrap();
+        let core =
+            format!("-\t2026-09-30T00:00:00Z\tchunk-id\t{chunk_rel}\t1\tplain-sha\t{cipher_hash}");
+        let manifest_hash = crate::crypto::sha256_bytes(core.as_bytes()).unwrap();
+        format!("{manifest_hash}\t{core}")
     }
 
     fn test_dir(tag: &str) -> Result<PathBuf, Box<dyn Error>> {

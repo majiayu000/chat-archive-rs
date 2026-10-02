@@ -230,6 +230,23 @@ fn backup_recovers_state_after_manifest_replace_failure() -> Result<(), Box<dyn 
             .count(),
         3
     );
+    {
+        let db = rusqlite::Connection::open(archive.join("state").join("state.db"))?;
+        let counts = db.query_row(
+            "SELECT (SELECT COUNT(*) FROM seen_ids),
+                    (SELECT COUNT(*) FROM checkpoints),
+                    (SELECT COUNT(*) FROM pending_backup_ops)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts, (0, 0, 1));
+    }
 
     let retry_envs = [("CHAT_ARCHIVE_CHUNK_PLAIN_BYTES", "1")];
     let retry = run_cli_with_env(
@@ -246,6 +263,23 @@ fn backup_recovers_state_after_manifest_replace_failure() -> Result<(), Box<dyn 
     )?;
     let retry_stdout = String::from_utf8_lossy(&retry.stdout);
     assert!(retry_stdout.contains("No new records discovered."));
+    {
+        let db = rusqlite::Connection::open(archive.join("state").join("state.db"))?;
+        let counts = db.query_row(
+            "SELECT (SELECT COUNT(*) FROM seen_ids),
+                    (SELECT COUNT(*) FROM checkpoints),
+                    (SELECT COUNT(*) FROM pending_backup_ops)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts, (3, 1, 0));
+    }
     assert_eq!(fs::read_dir(archive.join("chunks"))?.count(), 3);
     assert_eq!(
         fs::read_to_string(archive.join("manifests").join("manifest.tsv"))?
