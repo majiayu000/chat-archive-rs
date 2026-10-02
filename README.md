@@ -1,6 +1,11 @@
 # chat-archive-rs
 
-Personal Codex + Claude Code chat backup tool in Rust.
+A Rust CLI for incremental, encrypted backups of local Codex and Claude Code
+JSONL history. Verify archive integrity and restore records without depending
+on the original terminal session.
+
+[Build and install](#build) · [First recovery drill](#first-recovery-drill) · [Usage](#usage) ·
+[Report an issue](https://github.com/majiayu000/chat-archive-rs/issues)
 
 ## Features
 
@@ -31,17 +36,56 @@ Missing session directories or history files are optional.
 ## Build
 
 ```bash
-cd /Users/lifcc/Desktop/code/work/infra/chat-archive-rs
-cargo build
+git clone https://github.com/majiayu000/chat-archive-rs.git
+cd chat-archive-rs
+cargo install --locked --path .
 ```
+
+## First recovery drill
+
+Before relying on an archive, try a backup and restore with synthetic data in
+an isolated directory. Build with `cargo build --locked`, then run this from the
+repository root. The passphrase and recovery code below are public demo values;
+use them only for this disposable drill.
+
+```bash
+DRILL_DIR=$(mktemp -d)
+mkdir -p "$DRILL_DIR/codex/sessions" "$DRILL_DIR/claude/projects"
+printf '%s\n' '{"type":"user","message":{"content":"synthetic recovery drill"}}' > "$DRILL_DIR/claude/projects/demo.jsonl"
+export CODEX_HOME="$DRILL_DIR/codex"
+export CLAUDE_CONFIG_DIR="$DRILL_DIR/claude"
+./target/debug/chat-archive-rs --archive-dir "$DRILL_DIR/archive" show-sources
+./target/debug/chat-archive-rs --archive-dir "$DRILL_DIR/archive" init --passphrase 'demo-only' --recovery-code 'demo-recovery-only'
+./target/debug/chat-archive-rs --archive-dir "$DRILL_DIR/archive" backup --passphrase 'demo-only'
+./target/debug/chat-archive-rs --archive-dir "$DRILL_DIR/archive" verify --passphrase 'demo-only'
+./target/debug/chat-archive-rs --archive-dir "$DRILL_DIR/archive" restore --passphrase 'demo-only' --output-dir "$DRILL_DIR/restored"
+cat "$DRILL_DIR/restored/claude-raw.jsonl"
+unset CODEX_HOME CLAUDE_CONFIG_DIR
+```
+
+The restored raw file should contain the synthetic record. Prefer running the
+drill in a fresh shell so the overrides do not replace an existing session's
+configuration. Keep real passphrases out of shell history and process listings;
+the current CLI examples use argv and do not provide a hidden-input workflow.
+
+### What does restore recover?
+
+Restore writes canonical records and provider raw JSONL exports to the output
+directory. It does not reinstall a CLI, restore provider login credentials,
+copy your source-code workspace, or automatically re-register sessions for
+`codex resume` / `claude --resume`. Validate the exported records before any
+manual provider-specific import. Codex `archived_sessions` are excluded from
+backup discovery, even though the shared reader can discover them.
+
+For monitoring and supported runtime recovery while local session files remain,
+see [Keepline](https://github.com/majiayu000/keepline). It serves a different
+purpose from an encrypted archive and a verified restore.
 
 ## Usage
 
-Binary path:
-
-```bash
-/Users/lifcc/Desktop/code/work/infra/chat-archive-rs/target/debug/chat-archive-rs
-```
+`cargo install` puts `chat-archive-rs` in Cargo's binary directory (normally
+`~/.cargo/bin`); make sure that directory is on `PATH`. For development, use
+`cargo build --locked` and `./target/debug/chat-archive-rs`.
 
 Initialize:
 
