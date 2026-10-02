@@ -126,9 +126,10 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> AppResult<()> {
             .truncate(true)
             .write(true)
             .mode(0o600)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
             .open(path)
             .map_err(|e| format!("create private file {}: {e}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .map_err(|e| format!("chmod private file {}: {e}", path.display()))?;
         file.write_all(bytes)
             .map_err(|e| format!("write private file {}: {e}", path.display()))
