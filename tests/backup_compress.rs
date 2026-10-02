@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -23,6 +25,9 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
     let archive_arg = path_arg(&archive)?;
     let restore_arg = path_arg(&restore)?;
 
+    let unavailable_temp = root.join("unavailable-temp");
+    fs::write(&unavailable_temp, b"not a directory")?;
+    let unavailable_temp_arg = path_arg(&unavailable_temp)?;
     run_cli(
         bin,
         &home,
@@ -64,7 +69,7 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
             "test-passphrase",
         ],
     )?;
-    run_cli(
+    run_cli_with_env(
         bin,
         &home,
         &[
@@ -75,6 +80,11 @@ fn backup_with_compress_level_creates_verifiable_archive() -> Result<(), Box<dyn
             "test-passphrase",
             "--output-dir",
             restore_arg,
+        ],
+        &[
+            ("TMPDIR", unavailable_temp_arg),
+            ("TMP", unavailable_temp_arg),
+            ("TEMP", unavailable_temp_arg),
         ],
     )?;
     let restored = fs::read_to_string(restore.join("codex-raw.jsonl"))?;
@@ -220,6 +230,23 @@ fn backup_recovers_state_after_manifest_replace_failure() -> Result<(), Box<dyn 
             .count(),
         3
     );
+    {
+        let db = rusqlite::Connection::open(archive.join("state").join("state.db"))?;
+        let counts = db.query_row(
+            "SELECT (SELECT COUNT(*) FROM seen_ids),
+                    (SELECT COUNT(*) FROM checkpoints),
+                    (SELECT COUNT(*) FROM pending_backup_ops)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts, (0, 0, 1));
+    }
 
     let retry_envs = [("CHAT_ARCHIVE_CHUNK_PLAIN_BYTES", "1")];
     let retry = run_cli_with_env(
@@ -236,6 +263,23 @@ fn backup_recovers_state_after_manifest_replace_failure() -> Result<(), Box<dyn 
     )?;
     let retry_stdout = String::from_utf8_lossy(&retry.stdout);
     assert!(retry_stdout.contains("No new records discovered."));
+    {
+        let db = rusqlite::Connection::open(archive.join("state").join("state.db"))?;
+        let counts = db.query_row(
+            "SELECT (SELECT COUNT(*) FROM seen_ids),
+                    (SELECT COUNT(*) FROM checkpoints),
+                    (SELECT COUNT(*) FROM pending_backup_ops)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        assert_eq!(counts, (3, 1, 0));
+    }
     assert_eq!(fs::read_dir(archive.join("chunks"))?.count(), 3);
     assert_eq!(
         fs::read_to_string(archive.join("manifests").join("manifest.tsv"))?
@@ -697,6 +741,148 @@ fn backup_failure_does_not_advance_checkpoints() -> Result<(), Box<dyn Error>> {
     let retry_stdout = String::from_utf8_lossy(&retry.stdout);
     assert!(retry_stdout.contains("Archived new records: 1"));
 
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn restore_rejects_corruption_before_touching_outputs() -> Result<(), Box<dyn Error>> {
+    let root = create_test_workspace("restore-integrity")?;
+    let home = root.join("home");
+    let archive = root.join("archive");
+    fs::create_dir_all(home.join(".codex"))?;
+    fs::write(
+        home.join(".codex/history.jsonl"),
+        "{\"text\":\"first chunk\"}\n{\"text\":\"second chunk\"}\n",
+    )?;
+    let bin = Path::new(env!("CARGO_BIN_EXE_chat-archive-rs"));
+    let archive_arg = path_arg(&archive)?;
+    let envs = [("CHAT_ARCHIVE_CHUNK_PLAIN_BYTES", "1")];
+    init_archive(bin, &home, archive_arg, &envs)?;
+    run_cli_with_env(
+        bin,
+        &home,
+        &[
+            "--archive-dir",
+            archive_arg,
+            "backup",
+            "--passphrase",
+            "test-passphrase",
+        ],
+        &envs,
+    )?;
+
+    let manifest_path = archive.join("manifests/manifest.tsv");
+    let original_manifest = fs::read_to_string(&manifest_path)?;
+    let rows: Vec<Vec<String>> = original_manifest
+        .lines()
+        .map(|line| line.split('\t').map(str::to_string).collect())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    let chunk_path = archive.join(&rows[1][4]);
+    let original_chunk = fs::read(&chunk_path)?;
+    let output_files = [
+        "canonical-records.jsonl",
+        "codex-raw.jsonl",
+        "claude-raw.jsonl",
+        "restore-report.json",
+    ];
+    for (case, expected) in [
+        ("chain", "Manifest chain mismatch at entry 2"),
+        ("manifest-hash", "Manifest hash mismatch at entry 2"),
+        ("cipher-hash", "Cipher hash mismatch:"),
+        ("plain-hash", "Plain hash mismatch:"),
+        ("record-count", "Record count mismatch:"),
+        ("missing-chunk", "Missing chunk:"),
+        ("chunk-corruption", "Cipher hash mismatch:"),
+    ] {
+        let mut corrupt_rows = rows.clone();
+        match case {
+            "chain" => corrupt_rows[1][1] = "-".into(),
+            "manifest-hash" => corrupt_rows[1][0] = "0".repeat(64),
+            "cipher-hash" => corrupt_rows[1][7] = "0".repeat(64),
+            "plain-hash" => corrupt_rows[1][6] = "0".repeat(64),
+            "record-count" => corrupt_rows[1][5] = "2".into(),
+            "missing-chunk" => fs::remove_file(&chunk_path)?,
+            "chunk-corruption" => fs::write(&chunk_path, b"corrupt chunk")?,
+            _ => unreachable!(),
+        }
+        // Keep the entry hash valid so each case reaches its intended check.
+        if case != "manifest-hash" {
+            corrupt_rows[1][0] = format!(
+                "{:x}",
+                Sha256::digest(corrupt_rows[1][1..].join("\t").as_bytes())
+            );
+        }
+        fs::write(
+            &manifest_path,
+            format!(
+                "{}\n",
+                corrupt_rows
+                    .iter()
+                    .map(|row| row.join("\t"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+        let verify = run_cli_err(
+            bin,
+            &home,
+            &[
+                "--archive-dir",
+                archive_arg,
+                "verify",
+                "--passphrase",
+                "test-passphrase",
+            ],
+        )?;
+        let verify_stderr = String::from_utf8_lossy(&verify.stderr);
+        assert!(verify_stderr.contains(expected), "{case}: {verify_stderr}");
+
+        for existing in [false, true] {
+            let output = root.join(format!("restore-{case}-{existing}"));
+            if existing {
+                fs::create_dir(&output)?;
+                for name in output_files {
+                    fs::write(output.join(name), b"existing restore output\n")?;
+                }
+            }
+            let restored = run_cli_err(
+                bin,
+                &home,
+                &[
+                    "--archive-dir",
+                    archive_arg,
+                    "restore",
+                    "--passphrase",
+                    "test-passphrase",
+                    "--output-dir",
+                    path_arg(&output)?,
+                ],
+            )?;
+            assert_eq!(restored.status.code(), Some(1));
+            assert_eq!(restored.stderr, verify.stderr, "{case}");
+            assert!(restored.stdout.is_empty(), "{case}");
+            if existing {
+                for name in output_files {
+                    assert_eq!(
+                        fs::read(output.join(name))?,
+                        b"existing restore output\n",
+                        "{case}: {name}"
+                    );
+                }
+            } else {
+                assert!(!output.exists(), "{case}: output directory created");
+            }
+            let log = fs::read_to_string(archive.join("state/ops-log.jsonl"))?;
+            let entry: serde_json::Value =
+                serde_json::from_str(log.lines().last().ok_or("missing ops log")?)?;
+            assert_eq!(entry["operation"], "restore");
+            assert_eq!(entry["status"], "error");
+        }
+        fs::write(&manifest_path, &original_manifest)?;
+        fs::write(&chunk_path, &original_chunk)?;
+    }
     fs::remove_dir_all(root)?;
     Ok(())
 }

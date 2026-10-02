@@ -1,9 +1,10 @@
 use std::fs;
+use std::path::Path;
 use std::time::Instant;
 
 use crate::crypto::{openssl_decrypt_chunk, sha256_bytes};
 use crate::storage::load_manifest_entries;
-use crate::types::{AppResult, Cli};
+use crate::types::{AppResult, Cli, ManifestEntry};
 use crate::utils::{resolve_archive_path, utc_iso};
 
 use super::support::{unlock_archive_key, write_ops_error_log, write_ops_log};
@@ -47,6 +48,15 @@ pub fn cmd_verify(cli: &Cli) -> AppResult<()> {
 pub(super) fn run_verify_once(cli: &Cli) -> AppResult<VerifyStats> {
     let archive_key = unlock_archive_key(cli)?;
     let manifests = load_manifest_entries(&cli.archive_dir)?;
+    verify_manifest_entries(&cli.archive_dir, &archive_key, &manifests, |_| Ok(()))
+}
+
+pub(super) fn verify_manifest_entries(
+    archive_dir: &Path,
+    archive_key: &str,
+    manifests: &[ManifestEntry],
+    mut consume_cipher: impl FnMut(&[u8]) -> AppResult<()>,
+) -> AppResult<VerifyStats> {
     let mut prev = "-".to_string();
     let mut total = 0usize;
     for (idx, m) in manifests.iter().enumerate() {
@@ -67,7 +77,7 @@ pub(super) fn run_verify_once(cli: &Cli) -> AppResult<VerifyStats> {
         if chk != m.manifest_hash {
             return Err(format!("Manifest hash mismatch at entry {}", idx + 1));
         }
-        let chunk_path = resolve_archive_path(&cli.archive_dir, &m.chunk_rel)?;
+        let chunk_path = resolve_archive_path(archive_dir, &m.chunk_rel)?;
         if !chunk_path.exists() {
             return Err(format!("Missing chunk: {}", chunk_path.display()));
         }
@@ -76,7 +86,7 @@ pub(super) fn run_verify_once(cli: &Cli) -> AppResult<VerifyStats> {
         if cipher_hash != m.cipher_sha {
             return Err(format!("Cipher hash mismatch: {}", chunk_path.display()));
         }
-        let plain = openssl_decrypt_chunk(&cipher, &archive_key)?;
+        let plain = openssl_decrypt_chunk(&cipher, archive_key)?;
         let plain_hash = sha256_bytes(&plain)?;
         if plain_hash != m.plain_sha {
             return Err(format!("Plain hash mismatch: {}", chunk_path.display()));
@@ -95,6 +105,7 @@ pub(super) fn run_verify_once(cli: &Cli) -> AppResult<VerifyStats> {
         }
         total += count;
         prev = m.manifest_hash.clone();
+        consume_cipher(&cipher)?;
     }
 
     Ok(VerifyStats {
