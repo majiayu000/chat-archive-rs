@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{BufRead, BufReader, ErrorKind};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::crypto::sha256_bytes;
 use crate::types::{AppResult, ManifestEntry};
 use crate::utils::{random_hex, resolve_archive_path};
 
@@ -126,6 +127,30 @@ impl StateStore {
             }
 
             if manifest_contains_pending_lines(root, &manifest_entries)? {
+                for (chunk_rel, manifest_line) in &manifest_entries {
+                    let cipher_sha = manifest_line
+                        .splitn(8, '\t')
+                        .nth(7)
+                        .ok_or_else(|| "invalid pending manifest line field count".to_string())?;
+                    let chunk_path = resolve_archive_path(root, chunk_rel)?;
+                    // FlushFileBuffers requires write access on Windows.
+                    let mut chunk = File::options()
+                        .read(true)
+                        .write(cfg!(windows))
+                        .open(&chunk_path)
+                        .map_err(|e| format!("open pending chunk {}: {e}", chunk_path.display()))?;
+                    let mut cipher = Vec::new();
+                    chunk
+                        .read_to_end(&mut cipher)
+                        .map_err(|e| format!("read pending chunk {}: {e}", chunk_path.display()))?;
+                    if sha256_bytes(&cipher)? != cipher_sha {
+                        return Err(format!("Cipher hash mismatch: {}", chunk_path.display()));
+                    }
+                    chunk
+                        .sync_all()
+                        .map_err(|e| format!("sync pending chunk {}: {e}", chunk_path.display()))?;
+                }
+                sync_archive_metadata(root)?;
                 self.commit_pending_backup_state(&op_id)?;
                 recovered += 1;
             } else {
@@ -567,6 +592,28 @@ fn manifest_line_set(root: &Path) -> AppResult<HashSet<String>> {
         }
     }
     Ok(lines)
+}
+
+pub fn sync_archive_metadata(root: &Path) -> AppResult<()> {
+    // Windows flushes file metadata via FlushFileBuffers, using a writable
+    // handle after rename. It does not support the Unix directory-sync path.
+    // https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching
+    let manifest_path = root.join("manifests/manifest.tsv");
+    File::options()
+        .read(true)
+        .write(cfg!(windows))
+        .open(&manifest_path)
+        .and_then(|manifest| manifest.sync_all())
+        .map_err(|e| format!("sync manifest {}: {e}", manifest_path.display()))?;
+
+    #[cfg(not(windows))]
+    for rel in ["chunks", "manifests"] {
+        let path = root.join(rel);
+        File::open(&path)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("sync archive directory {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn load_manifest_entries(root: &Path) -> AppResult<Vec<ManifestEntry>> {
@@ -1089,6 +1136,171 @@ mod tests {
                 &[(chunk_rel.into(), format!("pending-{op_id}"))],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn pending_recovery_requires_all_chunks_before_committing_state() -> Result<(), Box<dyn Error>>
+    {
+        let root = test_dir("pending-recovery-chunks")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let entries = [
+            (
+                "chunks/first.enc".to_string(),
+                pending_manifest_line("chunks/first.enc", b"first cipher"),
+            ),
+            (
+                "chunks/second.enc".to_string(),
+                pending_manifest_line("chunks/second.enc", b"second cipher"),
+            ),
+        ];
+        fs::write(archive.join("chunks/first.enc"), b"first cipher")?;
+        fs::write(
+            archive.join("manifests/manifest.tsv"),
+            format!("{}\n{}\n", entries[0].1, entries[1].1),
+        )?;
+        let mut store = StateStore::open(&archive)?;
+        store.begin_pending_backup("recover")?;
+        store.stage_pending_seen_id("recover", "first-id")?;
+        store.stage_pending_seen_id("recover", "second-id")?;
+        store.stage_pending_checkpoint_updates("recover", &[("source.jsonl".into(), 42)])?;
+        store.stage_pending_manifest_entries("recover", &entries)?;
+
+        let err = store.recover_pending_backups(&archive).unwrap_err();
+        assert!(err.contains("second.enc"), "{err}");
+        assert!(!store.has_seen_id("first-id")?);
+        assert!(!store.has_seen_id("second-id")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, None);
+        assert_eq!(store.pending_manifest_entries("recover")?, entries);
+        drop(store);
+
+        let mut store = StateStore::open(&archive)?;
+        fs::write(archive.join("chunks/second.enc"), b"corrupt cipher")?;
+        let err = store.recover_pending_backups(&archive).unwrap_err();
+        assert!(err.contains("Cipher hash mismatch"), "{err}");
+        assert!(!store.has_seen_id("first-id")?);
+        assert!(!store.has_seen_id("second-id")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, None);
+        assert_eq!(store.pending_manifest_entries("recover")?, entries);
+
+        fs::write(archive.join("chunks/second.enc"), b"second cipher")?;
+        assert_eq!(store.recover_pending_backups(&archive)?, 1);
+        assert!(store.has_seen_id("first-id")?);
+        assert!(store.has_seen_id("second-id")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, Some(42));
+        assert!(store.pending_backup_op_ids()?.is_empty());
+        drop(store);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pending_recovery_rejects_chunks_outside_archive() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("pending-recovery-paths")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let outside = root.join("outside.enc");
+        fs::write(&outside, b"cipher")?;
+        let mut paths = vec![
+            "../outside.enc".to_string(),
+            outside.to_str().unwrap().into(),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, archive.join("chunks/linked.enc"))?;
+            paths.push("chunks/linked.enc".into());
+        }
+
+        let mut store = StateStore::open(&archive)?;
+        for (idx, chunk_rel) in paths.iter().enumerate() {
+            let op_id = format!("escape-{idx}");
+            let line = pending_manifest_line(chunk_rel, b"cipher");
+            fs::write(archive.join("manifests/manifest.tsv"), format!("{line}\n"))?;
+            store.begin_pending_backup(&op_id)?;
+            store.stage_pending_seen_id(&op_id, "must-not-skip")?;
+            store.stage_pending_checkpoint_updates(&op_id, &[("source.jsonl".into(), 42)])?;
+            store.stage_pending_manifest_entries(&op_id, &[(chunk_rel.clone(), line)])?;
+            assert!(store.recover_pending_backups(&archive).is_err());
+            assert!(!store.has_seen_id("must-not-skip")?);
+            assert_eq!(store.checkpoint("source.jsonl")?, None);
+            assert_eq!(store.pending_manifest_entries(&op_id)?.len(), 1);
+            // Isolate each invalid path without discarding its chunk.
+            let tx = store.conn.transaction()?;
+            delete_pending_backup_rows(&tx, &store.archive_key, &op_id)?;
+            tx.commit()?;
+        }
+        assert_eq!(fs::read(&outside)?, b"cipher");
+        drop(store);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_recovery_retains_state_when_files_cannot_be_synced() -> Result<(), Box<dyn Error>> {
+        let root = test_dir("pending-recovery-readonly")?;
+        let archive = root.join("archive");
+        ensure_layout(&archive)?;
+        let chunk_rel = "chunks/readonly.enc";
+        let chunk_path = archive.join("chunks").join("readonly.enc");
+        let manifest_path = archive.join("manifests/manifest.tsv");
+        let entries = [(
+            chunk_rel.to_string(),
+            pending_manifest_line(chunk_rel, b"cipher"),
+        )];
+        fs::write(&chunk_path, b"cipher")?;
+        fs::write(&manifest_path, format!("{}\n", entries[0].1))?;
+        for path in [&chunk_path, &manifest_path] {
+            // A read-only handle cannot call FlushFileBuffers on Windows,
+            // even while the file itself is writable.
+            let err = File::open(path)?.sync_all().unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            File::options().write(true).open(path)?.sync_all()?;
+        }
+        let mut store = StateStore::open(&archive)?;
+        store.begin_pending_backup("recover")?;
+        store.stage_pending_seen_id("recover", "must-not-skip")?;
+        store.stage_pending_checkpoint_updates("recover", &[("source.jsonl".into(), 42)])?;
+        store.stage_pending_manifest_entries("recover", &entries)?;
+
+        for (path, error_prefix) in [
+            (&chunk_path, "open pending chunk "),
+            (&manifest_path, "sync manifest "),
+        ] {
+            let original_permissions = fs::metadata(path)?.permissions();
+            let mut readonly = original_permissions.clone();
+            readonly.set_readonly(true);
+            fs::set_permissions(path, readonly)?;
+            let result = store.recover_pending_backups(&archive);
+            fs::set_permissions(path, original_permissions)?;
+            let err = result.unwrap_err();
+            assert!(err.starts_with(error_prefix), "{err}");
+            assert!(
+                err.contains(path.file_name().unwrap().to_str().unwrap()),
+                "{err}"
+            );
+            assert!(!store.has_seen_id("must-not-skip")?);
+            assert_eq!(store.checkpoint("source.jsonl")?, None);
+            assert_eq!(store.pending_manifest_entries("recover")?, entries);
+            drop(store);
+            store = StateStore::open(&archive)?;
+        }
+
+        assert_eq!(store.recover_pending_backups(&archive)?, 1);
+        assert!(store.has_seen_id("must-not-skip")?);
+        assert_eq!(store.checkpoint("source.jsonl")?, Some(42));
+        assert!(store.pending_backup_op_ids()?.is_empty());
+        drop(store);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn pending_manifest_line(chunk_rel: &str, cipher: &[u8]) -> String {
+        let cipher_hash = crate::crypto::sha256_bytes(cipher).unwrap();
+        let core =
+            format!("-\t2026-09-30T00:00:00Z\tchunk-id\t{chunk_rel}\t1\tplain-sha\t{cipher_hash}");
+        let manifest_hash = crate::crypto::sha256_bytes(core.as_bytes()).unwrap();
+        format!("{manifest_hash}\t{core}")
     }
 
     fn test_dir(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
