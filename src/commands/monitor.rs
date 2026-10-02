@@ -47,6 +47,7 @@ pub fn cmd_monitor(cli: &Cli) -> AppResult<()> {
     );
 
     let mut cycle: u64 = 0;
+    let mut run_error = None;
     loop {
         cycle += 1;
         let cycle_ts = utc_iso();
@@ -127,6 +128,9 @@ pub fn cmd_monitor(cli: &Cli) -> AppResult<()> {
                         format!("\"error\":\"{}\"", json_escape(&err)),
                     ],
                 );
+                if cycles > 0 {
+                    run_error.get_or_insert(err);
+                }
             }
         }
 
@@ -180,6 +184,9 @@ pub fn cmd_monitor(cli: &Cli) -> AppResult<()> {
                             format!("\"error\":\"{}\"", json_escape(&err)),
                         ],
                     );
+                    if cycles > 0 {
+                        run_error.get_or_insert(err);
+                    }
                 }
             }
         }
@@ -192,5 +199,5 @@ pub fn cmd_monitor(cli: &Cli) -> AppResult<()> {
         thread::sleep(Duration::from_secs(policy.interval_sec));
     }
 
-    Ok(())
+    run_error.map_or(Ok(()), Err)
 }
