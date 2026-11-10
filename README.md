@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Consolidated into **[remem](https://github.com/majiayu000/remem)** and **[agent-sessions](https://github.com/majiayu000/agent-sessions)**.
+
 # chat-archive-rs
 
 A Rust CLI for incremental, encrypted backups of local Codex and Claude Code
